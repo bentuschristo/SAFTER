@@ -1,0 +1,41 @@
+{
+  "width": 15.0,
+  "length": 15.0,
+  "wall_thickness": 0.12,
+  "wall_height": 0.8,
+  "wall_clearance": 0.2,
+  "obstacle_clearance": 0.2,
+  "max_obstacles": 5,
+  "obstacles": [
+    {
+      "x": -3.0,
+      "y": -2.0,
+      "radius": 0.55,
+      "height": 1.0
+    },
+    {
+      "x": -1.5,
+      "y": 2.2,
+      "radius": 0.45,
+      "height": 1.0
+    },
+    {
+      "x": 1.2,
+      "y": -1.0,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": 3.0,
+      "y": 2.3,
+      "radius": 0.5,
+      "height": 1.0
+    },
+    {
+      "x": 0.3,
+      "y": 3.8,
+      "radius": 0.4,
+      "height": 1.0
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 """Unitree Go2 velocity environment configurations."""
 
+from .obstacle_cfg import get_go2_navigation_arena_cfg
+
 from typing import Literal
 
 from src.assets.robots import (
@@ -166,5 +168,28 @@ def unitree_go2_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_vel_x = (-0.5, 1.0)
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
+
+  return cfg
+
+def unitree_go2_safe_navigation_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create Go2 flat environment with a fixed 15 x 15 m obstacle arena."""
+
+  cfg = unitree_go2_flat_env_cfg(play=play)
+
+  entities = dict(cfg.scene.entities or {})
+  entities["navigation_arena"] = get_go2_navigation_arena_cfg()
+  cfg.scene.entities = entities
+
+  cfg.sim.njmax = max(cfg.sim.njmax or 0, 1000)
+  cfg.sim.contact_sensor_maxmatch = max(
+    cfg.sim.contact_sensor_maxmatch or 0,
+    256,
+  )
+
+  cfg.viewer.body_name = "base_link"
+  cfg.viewer.distance = 12.0
+  cfg.viewer.elevation = -45.0
 
   return cfg

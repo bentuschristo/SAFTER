@@ -1,0 +1,19 @@
+This repository is a derivative work based on unitreerobotics/unitree_rl_mjlab
+(https://github.com/unitreerobotics/unitree_rl_mjlab), licensed under the
+Apache License, Version 2.0 (see LICENCE).
+
+Modifications and additions in this repository include:
+- New safety-filter research code: SAFTER_src/, SAFTER_scripts/
+- New high-level RL packages: src/high_level_rl/, src/high_level_bcbf_sac/,
+  src/high_level_control/, src/high_level_sac/, src/high_level_cbf_rl/,
+  src/timeout90_overlay/
+- New task config/assets: src/tasks/velocity/mdp/cbf_filter.py,
+  src/tasks/velocity/config/go2/obstacle_cfg.py, and additional MJCF scenes
+  under src/assets/robots/unitree_go2/xmls/
+- Research/evaluation scripts under scripts/
+- Modifications to setup.py, src/assets/robots/unitree_go2/xmls/go2.xml,
+  and src/tasks/velocity/config/go2/ (env_cfgs.py, __init__.py)
+
+The original locomotion/simulation baseline (robot assets, task configs,
+simulation plumbing under src/, doc/, deploy/, simulate/) is unmodified
+upstream code except where noted above.

@@ -1,0 +1,54 @@
+{
+  "width": 15.0,
+  "length": 15.0,
+  "wall_thickness": 0.12,
+  "wall_height": 0.8,
+  "robot_radius": 0.3,
+  "wall_clearance": 0.15,
+  "obstacle_clearance": 0.15,
+  "max_obstacles": 12,
+  "obstacles": [
+    {
+      "x": -4.1,
+      "y": -3.5,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": -3.5,
+      "y": 3.5,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": -0.6,
+      "y": 2.1,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": 3.8,
+      "y": -3.5,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": 0.4,
+      "y": -5.2,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": -1.1,
+      "y": 5.1,
+      "radius": 0.6,
+      "height": 1.0
+    },
+    {
+      "x": 4.8,
+      "y": 4.4,
+      "radius": 0.6,
+      "height": 1.0
+    }
+  ]
+}
