@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "generator": "generate_procedural_navigation_maps.py",
+  "num_maps": 5,
+  "scenarios_per_map": 200,
+  "num_scenarios": 1000,
+  "seed": 42,
+  "difficulty_mode": "medium",
+  "max_obstacles": 12,
+  "difficulty_counts": {
+    "easy": 0,
+    "medium": 5,
+    "hard": 0
+  },
+  "scenario_difficulty_counts": {
+    "easy": 0,
+    "medium": 1000,
+    "hard": 0
+  },
+  "maps": [
+    {
+      "map_id": 0,
+      "file": "maps/map_000.json",
+      "arena_file": "arenas/map_000_arena.json",
+      "occupancy_file": "occupancy/map_000.npz",
+      "difficulty": "medium",
+      "difficulty_score": 0.7442545669857357,
+      "layout_family": "mixed",
+      "obstacle_count": 7,
+      "scenario_id_start": 0,
+      "scenario_id_end": 199
+    },
+    {
+      "map_id": 1,
+      "file": "maps/map_001.json",
+      "arena_file": "arenas/map_001_arena.json",
+      "occupancy_file": "occupancy/map_001.npz",
+      "difficulty": "medium",
+      "difficulty_score": 0.0,
+      "layout_family": "mixed",
+      "obstacle_count": 7,
+      "scenario_id_start": 200,
+      "scenario_id_end": 399
+    },
+    {
+      "map_id": 2,
+      "file": "maps/map_002.json",
+      "arena_file": "arenas/map_002_arena.json",
+      "occupancy_file": "occupancy/map_002.npz",
+      "difficulty": "medium",
+      "difficulty_score": 1.0,
+      "layout_family": "mixed",
+      "obstacle_count": 7,
+      "scenario_id_start": 400,
+      "scenario_id_end": 599
+    },
+    {
+      "map_id": 3,
+      "file": "maps/map_003.json",
+      "arena_file": "arenas/map_003_arena.json",
+      "occupancy_file": "occupancy/map_003.npz",
+      "difficulty": "medium",
+      "difficulty_score": 0.379670272351237,
+      "layout_family": "mixed",
+      "obstacle_count": 7,
+      "scenario_id_start": 600,
+      "scenario_id_end": 799
+    },
+    {
+      "map_id": 4,
+      "file": "maps/map_004.json",
+      "arena_file": "arenas/map_004_arena.json",
+      "occupancy_file": "occupancy/map_004.npz",
+      "difficulty": "medium",
+      "difficulty_score": 0.18344244166583387,
+      "layout_family": "mixed",
+      "obstacle_count": 7,
+      "scenario_id_start": 800,
+      "scenario_id_end": 999
+    }
+  ]
+}
