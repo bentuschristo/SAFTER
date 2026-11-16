@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -53,7 +54,10 @@ import mujoco  # noqa: F401,E402
 import torch  # noqa: E402
 
 from SAFTER_src.high_level_rl.laser_cbf_filters import (  # noqa: E402
+    LaserZeroBackupCdLseAdapted,
     LaserZeroBackupLseCbfClosedForm,
+    LaserZeroBackupLseControlDynamicsQp,
+    LaserZeroBackupLseControlDynamicsQpCfMatched,
     LaserZeroBackupLseQp,
 )
 
@@ -89,7 +93,9 @@ DEFAULT_VANILLA_CHECKPOINT = (
 
 DEFAULT_MAPS = ("low_shift", "medium_shift", "high_shift")
 AVAILABLE_MAPS = tuple(name for name in UNSEEN_MAPS if name in STRUCTURED_SCENARIO_REGIONS)
-FILTER_TYPES = ("safter", "bcbf_lse_qp")
+FILTER_TYPES = (
+    "safter", "bcbf_lse_qp", "bcbf_lse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted",
+)
 
 
 def build_retrofit_filter(filter_type: str, cfg, action_limits: tuple[float, float, float, float | None]):
@@ -145,6 +151,103 @@ def build_retrofit_filter(filter_type: str, cfg, action_limits: tuple[float, flo
             backup_margin=safety_cfg.backup_margin,
             backup_samples=safety_cfg.backup_samples,
             kappa_backup=safety_cfg.kappa_backup,
+            max_active_candidates=safety_cfg.qp_max_active_candidates,
+            feasibility_tolerance=safety_cfg.qp_feasibility_tolerance,
+            qp_regularization=safety_cfg.qp_regularization,
+            straight_through=safety_cfg.qp_straight_through,
+            qp_backend="active_set",
+            **kwargs,
+        )
+    if filter_type == "bcbf_lse_cd_qp":
+        # The control-dynamics (velocity-as-state) counterpart of
+        # "bcbf_lse_qp" above -- QP synthesis of the SAME augmented LSE
+        # barrier SAFTER itself uses (same command dynamics/backup/terminal
+        # model as the "safter" branch), differing only in how the resulting
+        # affine constraint is solved (QP projector here vs SAFTER's
+        # analytical closed form). This is the Rabiee & Hoagg (2025)
+        # adaptation's actually-matched baseline -- their own paper models
+        # body velocity as a state with a hard-bounded acceleration input,
+        # which is a control-dynamics structure, not the plain hard-box-on-
+        # velocity "bcbf_lse_qp" branch above.
+        return LaserZeroBackupLseControlDynamicsQp(
+            backup_margin=safety_cfg.backup_margin,
+            backup_horizon_s=safety_cfg.backup_horizon_s,
+            backup_samples=safety_cfg.backup_samples,
+            backup_rollout_substeps=safety_cfg.backup_rollout_substeps,
+            hocbf_k0=safety_cfg.hocbf_k0,
+            barrier_rate_scale=safety_cfg.barrier_rate_scale,
+            kappa_backup=safety_cfg.kappa_backup,
+            kappa_input=safety_cfg.kappa_input,
+            kappa_outer=safety_cfg.kappa_outer,
+            alpha_outer=safety_cfg.alpha_outer,
+            control_dynamics_a=safety_cfg.control_dynamics_a,
+            tracking_sigma=safety_cfg.tracking_sigma,
+            integration_dt=safety_cfg.integration_dt,
+            terminal_backup_mode=safety_cfg.terminal_backup_mode,
+            terminal_geom_scale=safety_cfg.terminal_geom_scale,
+            terminal_rec_scale=safety_cfg.terminal_rec_scale,
+            legacy_projection=safety_cfg.legacy_projection,
+            max_active_candidates=safety_cfg.qp_max_active_candidates,
+            feasibility_tolerance=safety_cfg.qp_feasibility_tolerance,
+            qp_regularization=safety_cfg.qp_regularization,
+            straight_through=safety_cfg.qp_straight_through,
+            qp_backend="active_set",
+            **kwargs,
+        )
+    if filter_type == "bcbf_lse_cd_qp_cfmatched":
+        # The exact-differentiable-QP (QpthProjector) counterpart of
+        # bcbf_lse_cd_qp above -- same composite LSE barrier/backup/terminal
+        # model, but always solves with an exact batched QP/KKT solve
+        # instead of the straight-through active-set approximation. Meant
+        # to be paired with a policy actually TRAINED under this same
+        # cfmatched filter (e.g. go2_safe_navigation_sac_laser_bcbf_lse_cd_qp_cfmatched
+        # checkpoints), not retrofitted onto a mismatched policy.
+        return LaserZeroBackupLseControlDynamicsQpCfMatched(
+            backup_margin=safety_cfg.backup_margin,
+            backup_horizon_s=safety_cfg.backup_horizon_s,
+            backup_samples=safety_cfg.backup_samples,
+            backup_rollout_substeps=safety_cfg.backup_rollout_substeps,
+            hocbf_k0=safety_cfg.hocbf_k0,
+            barrier_rate_scale=safety_cfg.barrier_rate_scale,
+            kappa_backup=safety_cfg.kappa_backup,
+            kappa_input=safety_cfg.kappa_input,
+            kappa_outer=safety_cfg.kappa_outer,
+            alpha_outer=safety_cfg.alpha_outer,
+            control_dynamics_a=safety_cfg.control_dynamics_a,
+            tracking_sigma=safety_cfg.tracking_sigma,
+            integration_dt=safety_cfg.integration_dt,
+            terminal_backup_mode=safety_cfg.terminal_backup_mode,
+            terminal_geom_scale=safety_cfg.terminal_geom_scale,
+            terminal_rec_scale=safety_cfg.terminal_rec_scale,
+            legacy_projection=safety_cfg.legacy_projection,
+            max_active_candidates=safety_cfg.qp_max_active_candidates,
+            feasibility_tolerance=safety_cfg.qp_feasibility_tolerance,
+            qp_regularization=safety_cfg.qp_regularization,
+            straight_through=safety_cfg.qp_straight_through,
+            qp_backend="active_set",
+            **kwargs,
+        )
+    if filter_type == "bcbf_cd_lse_adapted":
+        # Control-dynamics bCBF-QP filter combining all constraints with a
+        # single flat softmin (see LaserZeroBackupCdLseAdapted docstring).
+        return LaserZeroBackupCdLseAdapted(
+            backup_margin=safety_cfg.backup_margin,
+            backup_horizon_s=safety_cfg.backup_horizon_s,
+            backup_samples=safety_cfg.backup_samples,
+            backup_rollout_substeps=safety_cfg.backup_rollout_substeps,
+            hocbf_k0=safety_cfg.hocbf_k0,
+            barrier_rate_scale=safety_cfg.barrier_rate_scale,
+            kappa_backup=safety_cfg.kappa_backup,
+            kappa_input=safety_cfg.kappa_input,
+            kappa_outer=safety_cfg.kappa_outer,
+            alpha_outer=safety_cfg.alpha_outer,
+            control_dynamics_a=safety_cfg.control_dynamics_a,
+            tracking_sigma=safety_cfg.tracking_sigma,
+            integration_dt=safety_cfg.integration_dt,
+            terminal_backup_mode=safety_cfg.terminal_backup_mode,
+            terminal_geom_scale=safety_cfg.terminal_geom_scale,
+            terminal_rec_scale=safety_cfg.terminal_rec_scale,
+            legacy_projection=safety_cfg.legacy_projection,
             max_active_candidates=safety_cfg.qp_max_active_candidates,
             feasibility_tolerance=safety_cfg.qp_feasibility_tolerance,
             qp_regularization=safety_cfg.qp_regularization,
@@ -306,6 +409,13 @@ def evaluate_map(
     )
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
+    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters
+    # -- see evaluate_laser_unseen_maps_structured.evaluate_method_vectorized
+    # for the full rationale.
+    pooled_diag_steps = 0
+    pooled_clip_steps = 0
+    pooled_clip_violation_steps = 0
+    pooled_no_clip_violation_steps = 0
     try:
         verify_compiled_physical_map(raw_env, env, map_name)
 
@@ -335,6 +445,11 @@ def evaluate_map(
             ]
             active_steps = [0] * active_count
             correction_sums = [0.0] * active_count
+            clip_triggered_steps = [0] * active_count
+            clip_delta_sums = [0.0] * active_count
+            clip_delta_maxes = [0.0] * active_count
+            barrier_violated_post_clip_steps = [0] * active_count
+            residual_exec_mins = [math.inf] * active_count
             returns = [0.0] * active_count
             step_counts = [0] * active_count
 
@@ -349,7 +464,15 @@ def evaluate_map(
 
                     ranges = actor._ranges(actor_obs)
                     angles = actor.ray_angles.to(device=actor_obs.device, dtype=actor_obs.dtype)
-                    if filter_type == "safter":
+                    if filter_type in (
+                        "safter", "bcbf_lse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted",
+                    ):
+                        # Both are control-dynamics (velocity-as-state)
+                        # filters -- they need the env's own tracked
+                        # current-command/previous-nominal-command/history-
+                        # valid observation slices, same as SAFTER's own
+                        # actor uses internally. Only the no-CD bcbf_lse_qp
+                        # filter below has no such state to feed.
                         retrofit = retrofit_filter.filter(
                             ranges, angles, actor_obs[:, 5:8], nominal, actor_obs[:, -4:-1], actor_obs[:, -1:],
                         )
@@ -396,6 +519,32 @@ def evaluate_map(
                         filter_active = correction_value > 1e-8
                         active_steps[env_id] += int(filter_active)
 
+                        # Reviewer diagnostic: how often the retrofit filter's
+                        # own hard clip changes the command, and whether the
+                        # as-executed command (`retrofit.command`, matching
+                        # `applied` here since action_limits are identical)
+                        # still satisfies the CBF condition.
+                        clip_delta_flags = getattr(retrofit, "clip_delta", None)
+                        if clip_delta_flags is not None:
+                            clip_delta_value = float(clip_delta_flags[env_id].detach().cpu())
+                            clip_delta_sums[env_id] += clip_delta_value
+                            clip_delta_maxes[env_id] = max(clip_delta_maxes[env_id], clip_delta_value)
+                        clip_changed_flags = getattr(retrofit, "clip_changed", None)
+                        if clip_changed_flags is not None:
+                            clip_triggered_steps[env_id] += int(bool(clip_changed_flags[env_id]))
+                        residual_exec_flags = getattr(retrofit, "residual_exec", None)
+                        if residual_exec_flags is not None:
+                            residual_exec_value = float(residual_exec_flags[env_id].detach().cpu())
+                            is_barrier_violated = residual_exec_value < 0.0
+                            barrier_violated_post_clip_steps[env_id] += int(is_barrier_violated)
+                            residual_exec_mins[env_id] = min(residual_exec_mins[env_id], residual_exec_value)
+                            pooled_diag_steps += 1
+                            if clip_changed_flags is not None and bool(clip_changed_flags[env_id]):
+                                pooled_clip_steps += 1
+                                pooled_clip_violation_steps += int(is_barrier_violated)
+                            else:
+                                pooled_no_clip_violation_steps += int(is_barrier_violated)
+
                         trajectory_row = None
                         if args.log_trajectories:
                             trajectory_row = {
@@ -421,6 +570,17 @@ def evaluate_map(
                                 "safe_vy_mps": float(applied[env_id, 1].detach().cpu()),
                                 "safe_wz_radps": float(applied[env_id, 2].detach().cpu()),
                                 "command_correction_norm": correction_value,
+                                "clip_delta_m_s": (
+                                    float(clip_delta_flags[env_id].detach().cpu())
+                                    if clip_delta_flags is not None else math.nan
+                                ),
+                                "clip_changed": (
+                                    int(bool(clip_changed_flags[env_id])) if clip_changed_flags is not None else 0
+                                ),
+                                "residual_exec": (
+                                    float(residual_exec_flags[env_id].detach().cpu())
+                                    if residual_exec_flags is not None else math.nan
+                                ),
                                 "filter_active": int(filter_active),
                                 "physical_clearance_m": clearance,
                                 "cumulative_path_length_m": path_lengths[env_id],
@@ -473,6 +633,15 @@ def evaluate_map(
                                 "mean_command_correction_norm": (
                                     correction_sums[env_id] / max(step_counts[env_id], 1)
                                 ),
+                                "clip_triggered_fraction": clip_triggered_steps[env_id] / max(step_counts[env_id], 1),
+                                "mean_clip_delta_m_s": clip_delta_sums[env_id] / max(step_counts[env_id], 1),
+                                "max_clip_delta_m_s": clip_delta_maxes[env_id],
+                                "barrier_violated_post_clip_fraction": (
+                                    barrier_violated_post_clip_steps[env_id] / max(step_counts[env_id], 1)
+                                ),
+                                "min_residual_exec": (
+                                    residual_exec_mins[env_id] if math.isfinite(residual_exec_mins[env_id]) else math.nan
+                                ),
                             })
                             finished[env_id] = True
                             completed_total = batch_start + sum(finished)
@@ -508,6 +677,25 @@ def evaluate_map(
             "minimum_clearance_overall_m": min(float(r["minimum_physical_clearance_m"]) for r in records),
             "mean_filter_active_fraction": mean(float(r["filter_active_fraction"]) for r in records),
             "mean_command_correction_norm": mean(float(r["mean_command_correction_norm"]) for r in records),
+            "mean_clip_triggered_fraction": mean(float(r["clip_triggered_fraction"]) for r in records),
+            "mean_clip_delta_m_s": mean(float(r["mean_clip_delta_m_s"]) for r in records),
+            "max_clip_delta_m_s": max(float(r["max_clip_delta_m_s"]) for r in records),
+            "mean_barrier_violated_post_clip_fraction": mean(
+                float(r["barrier_violated_post_clip_fraction"]) for r in records
+            ),
+            "min_residual_exec_overall": min(
+                (float(r["min_residual_exec"]) for r in records if math.isfinite(float(r["min_residual_exec"]))),
+                default=math.nan,
+            ),
+            "pooled_diag_steps": pooled_diag_steps,
+            "pooled_clip_steps": pooled_clip_steps,
+            "pooled_clip_triggered_rate": pooled_clip_steps / max(pooled_diag_steps, 1),
+            "pooled_barrier_violated_given_clip_rate": (
+                pooled_clip_violation_steps / pooled_clip_steps if pooled_clip_steps > 0 else math.nan
+            ),
+            "pooled_barrier_violated_given_no_clip_rate": (
+                pooled_no_clip_violation_steps / max(pooled_diag_steps - pooled_clip_steps, 1)
+            ),
         }
         return {"records": records, "trajectory_records": trajectory_records, "summary": summary}
     finally:

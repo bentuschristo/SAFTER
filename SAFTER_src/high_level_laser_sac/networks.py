@@ -16,6 +16,7 @@ from SAFTER_src.high_level_rl.laser_cbf_filters import (
     LaserScanCbfLseControlDynamicsQp,
     LaserScanCbfLseControlDynamicsQpCfMatched,
     LaserZeroBackupCbfQp,
+    LaserZeroBackupCdLseAdapted,
     LaserZeroBackupNonLseControlDynamicsQp,
     LaserZeroBackupLseControlDynamicsQp,
     LaserZeroBackupLseControlDynamicsQpCfMatched,
@@ -215,6 +216,8 @@ class LaserSafeSacActor(nn.Module):
                 kappa_outer=safety_cfg.kappa_outer,
                 alpha_outer=safety_cfg.alpha_outer,
                 control_dynamics_a=safety_cfg.control_dynamics_a,
+                backup_target_command=safety_cfg.backup_target_command,
+                backup_intent_decay_rate=safety_cfg.backup_intent_decay_rate,
                 tracking_sigma=safety_cfg.tracking_sigma,
                 integration_dt=safety_cfg.integration_dt,
                 terminal_backup_mode=safety_cfg.terminal_backup_mode,
@@ -278,6 +281,34 @@ class LaserSafeSacActor(nn.Module):
             )
         elif method == "bcbf_lse_cd_qp_cfmatched":
             self.safety_filter = LaserZeroBackupLseControlDynamicsQpCfMatched(
+                backup_margin=safety_cfg.backup_margin,
+                backup_horizon_s=safety_cfg.backup_horizon_s,
+                backup_samples=safety_cfg.backup_samples,
+                backup_rollout_substeps=safety_cfg.backup_rollout_substeps,
+                hocbf_k0=safety_cfg.hocbf_k0,
+                barrier_rate_scale=safety_cfg.barrier_rate_scale,
+                kappa_backup=safety_cfg.kappa_backup,
+                kappa_input=safety_cfg.kappa_input,
+                kappa_outer=safety_cfg.kappa_outer,
+                alpha_outer=safety_cfg.alpha_outer,
+                control_dynamics_a=safety_cfg.control_dynamics_a,
+                tracking_sigma=safety_cfg.tracking_sigma,
+                integration_dt=safety_cfg.integration_dt,
+                terminal_backup_mode=safety_cfg.terminal_backup_mode,
+                terminal_geom_scale=safety_cfg.terminal_geom_scale,
+                terminal_rec_scale=safety_cfg.terminal_rec_scale,
+                max_active_candidates=safety_cfg.qp_max_active_candidates,
+                feasibility_tolerance=safety_cfg.qp_feasibility_tolerance,
+                qp_regularization=safety_cfg.qp_regularization,
+                straight_through=safety_cfg.qp_straight_through,
+                qp_backend=safety_cfg.qp_backend,
+                **kwargs,
+            )
+        elif method == "bcbf_cd_lse_adapted":
+            # Control-dynamics bCBF-QP filter combining all constraints with
+            # a single flat softmin (see LaserZeroBackupCdLseAdapted
+            # docstring in laser_cbf_filters.py).
+            self.safety_filter = LaserZeroBackupCdLseAdapted(
                 backup_margin=safety_cfg.backup_margin,
                 backup_horizon_s=safety_cfg.backup_horizon_s,
                 backup_samples=safety_cfg.backup_samples,
@@ -437,19 +468,36 @@ class LaserSafeSacActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dims: tuple[int, ...]) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dims: tuple[int, ...], extra_action_dim: int = 0) -> None:
         super().__init__()
-        self.net = mlp(obs_dim + action_dim, hidden_dims, 1)
+        self.net = mlp(obs_dim + action_dim + extra_action_dim, hidden_dims, 1)
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat((obs, action), dim=-1))
+    def forward(
+        self, obs: torch.Tensor, action: torch.Tensor, extra_action: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        parts = (obs, action) if extra_action is None else (obs, action, extra_action)
+        return self.net(torch.cat(parts, dim=-1))
 
 
 class TwinQCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dims: tuple[int, ...]) -> None:
-        super().__init__()
-        self.q1 = QNetwork(obs_dim, action_dim, hidden_dims)
-        self.q2 = QNetwork(obs_dim, action_dim, hidden_dims)
+    """extra_action_dim=0 (the default) reproduces every existing
+    checkpoint's critic exactly: Q(obs, action). A nonzero extra_action_dim
+    (critic_sees_nominal_action ablation) instead learns Q(obs, action,
+    extra_action) -- intended for extra_action = the CURRENT-step nominal
+    (pre-filter) action, alongside the usual safe/executed action, so the
+    critic can directly attribute value to "what the policy wanted" versus
+    "what the filter actually let through" instead of inferring it
+    indirectly from the one-step-stale previous_nominal_command already
+    baked into obs."""
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.q1(obs, action), self.q2(obs, action)
+    def __init__(
+        self, obs_dim: int, action_dim: int, hidden_dims: tuple[int, ...], extra_action_dim: int = 0
+    ) -> None:
+        super().__init__()
+        self.q1 = QNetwork(obs_dim, action_dim, hidden_dims, extra_action_dim)
+        self.q2 = QNetwork(obs_dim, action_dim, hidden_dims, extra_action_dim)
+
+    def forward(
+        self, obs: torch.Tensor, action: torch.Tensor, extra_action: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.q1(obs, action, extra_action), self.q2(obs, action, extra_action)

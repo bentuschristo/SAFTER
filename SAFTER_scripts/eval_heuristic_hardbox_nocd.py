@@ -27,6 +27,33 @@ paper:
    (not a class-K-equivalent-to-a-box trick; see that class's `filter()`
    method: `A_box`/`b_box` are plain `u <= upper`, `-u <= -lower` rows).
 
+   2026-11-15 FOLLOW-UP CORRECTION: the filter (above) is right to stay
+   stateless, but the NOMINAL heuristic P-controller
+   (BatchedGoToGoalController below) was still wrong -- it applied its
+   position/yaw-error P-law output directly as the instantaneously-realized
+   body velocity every step (no inertia), which isn't physically
+   realistic: a real robot can't jump to an arbitrary velocity in one
+   control tick. PER THE USER'S EXPLICIT CORRECTION, citing Rabiee & Hoagg,
+   "Soft-Minimum and Soft-Maximum Barrier Functions for Safety with
+   Actuation Constraints," Automatica 171:111921 (2025) / arXiv:2305.10620
+   -- that paper's own nonholonomic-ground-robot example (their state
+   x=[q_x,q_y,v,theta], v the speed) makes v a STATE with v_dot = u
+   (plain integrator, unit gain, no decay term) and u a HARD-BOUNDED
+   ACCELERATION input (their U = {u1 in [-4,4], u2 in [-1,1]}, a fixed box
+   directly on u, not derived from any velocity bound). This script's
+   heuristic controller now mirrors that exactly:
+   BatchedGoToGoalController.compute() reinterprets its P-law output as an
+   acceleration, hard-clips it to HEURISTIC_MIN_ACCEL/MAX_ACCEL, and
+   integrates it into a per-env velocity STATE (maintained in
+   evaluate_map()'s batch loop) that IS the nominal command handed to the
+   filter -- so the heuristic itself now has inertia, same as the real
+   plant would. Scoped to THIS script only: eval_heuristic_vs_sac_training_
+   maps.py imports this same class but calls compute() without
+   velocity_state/dt, so it keeps the old stateless behavior unchanged
+   (both call styles are supported -- see compute()'s docstring).
+   eval_heuristic_safter.py has its own separate copy of this class,
+   untouched by this edit.
+
 Scenarios/geometry (UNSEEN_MAPS, STRUCTURED_SCENARIO_REGIONS, the
 structured scenario sampler with its direct-path-blocked diagnostics, the
 mjlab environment construction, and the step_safe()-based episode loop) are
@@ -63,6 +90,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import math
 import sys
 from dataclasses import replace
 from datetime import datetime
@@ -93,6 +121,15 @@ import mujoco  # noqa: F401,E402
 import torch  # noqa: E402
 
 from SAFTER_src.high_level_rl.laser_cbf_filters import LaserZeroBackupLseQp  # noqa: E402
+
+# build_retrofit_filter gives us the control-dynamics (velocity-as-state)
+# bCBF-LSE-CD-QP variant for free, built from `cfg.safety` (SAFTER's own
+# command-dynamics/backup/terminal defaults) exactly as eval_vanilla_
+# filterswap.py's "safter"/"bcbf_lse_qp" branches already do. Only used for
+# --filter-type bcbf_lse_cd_qp below; the default bcbf_lse_qp path keeps
+# constructing LaserZeroBackupLseQp inline, unchanged, so existing results
+# produced by this script are unaffected.
+from SAFTER_scripts.eval_vanilla_filterswap import build_retrofit_filter  # noqa: E402
 
 # Reused, unmodified, from the reference structured-map evaluator. That
 # script is import-safe (module-scope code is only dict/dataclass
@@ -161,9 +198,21 @@ FILTER_QP_KWARGS: dict[str, Any] = dict(
 # ControllerConfig defaults, src/high_level_control/config.py. kp_x/kp_y/
 # kp_yaw are the P-gains; min/max_v* are the heuristic's OWN output clip
 # (independent of, and well inside, the filter's own hard box above).
+# Still used verbatim for the legacy stateless call path (velocity_state=
+# None), e.g. eval_heuristic_vs_sac_training_maps.py.
 HEURISTIC_KP = (0.8, 0.8, 1.5)
 HEURISTIC_MIN_CMD = (-0.8, -0.7, -1.0)
 HEURISTIC_MAX_CMD = (1.2, 0.7, 1.0)
+
+# Stateful path only (this script): the SAME P-law output is now
+# reinterpreted as a hard-bounded ACCELERATION (m/s^2, m/s^2, rad/s^2)
+# instead of a velocity -- reusing the old HEURISTIC_MIN_CMD/MAX_CMD
+# magnitudes as a starting point, exactly as the cited paper (Rabiee &
+# Hoagg, Automatica 2025) picked its own ubar1=4/ubar2=1 box without
+# deriving it from a physical actuator spec. Tune independently if this
+# bound turns out to not match the real Go2's achievable acceleration.
+HEURISTIC_MIN_ACCEL = (-0.8, -0.7, -1.0)
+HEURISTIC_MAX_ACCEL = (1.2, 0.7, 1.0)
 
 
 class BatchedGoToGoalController:
@@ -201,17 +250,51 @@ class BatchedGoToGoalController:
     target. This is the one design choice this port had to make that is
     not pinned down by controller.py/trajectories.py/model.py themselves
     (those assume a caller-supplied fixed goal_yaw).
+
+    Two call styles, both supported by compute():
+
+    - Legacy/stateless (velocity_state=None, the default): the P-law
+      output IS the instantaneously-applied body velocity, clipped to
+      HEURISTIC_MIN_CMD/MAX_CMD -- exactly the original behavior, kept for
+      eval_heuristic_vs_sac_training_maps.py, which calls compute() with
+      only 3 positional args and must not change behavior here.
+    - Stateful (velocity_state and dt given): per Rabiee & Hoagg,
+      Automatica 2025 (arXiv:2305.10620, Example 3), velocity is a STATE
+      with v_dot = u (plain integrator, no decay) and the SAME P-law
+      output is instead a hard-bounded ACCELERATION u (clipped to
+      HEURISTIC_MIN_ACCEL/MAX_ACCEL) that gets integrated one step:
+      v_{t+1} = v_t + u*dt. The caller (evaluate_map()) owns and resets
+      the velocity_state tensor; this method is a pure function of its
+      inputs otherwise. Used by this script only.
     """
 
     def __init__(self, device: torch.device | str, dtype: torch.dtype = torch.float32) -> None:
         self.kp = torch.tensor(HEURISTIC_KP, device=device, dtype=dtype)
         self.min_cmd = torch.tensor(HEURISTIC_MIN_CMD, device=device, dtype=dtype)
         self.max_cmd = torch.tensor(HEURISTIC_MAX_CMD, device=device, dtype=dtype)
+        self.min_accel = torch.tensor(HEURISTIC_MIN_ACCEL, device=device, dtype=dtype)
+        self.max_accel = torch.tensor(HEURISTIC_MAX_ACCEL, device=device, dtype=dtype)
 
     def compute(
-        self, pose_xy: torch.Tensor, yaw: torch.Tensor, goal_xy: torch.Tensor
+        self,
+        pose_xy: torch.Tensor,
+        yaw: torch.Tensor,
+        goal_xy: torch.Tensor,
+        velocity_state: torch.Tensor | None = None,
+        dt: float | None = None,
     ) -> torch.Tensor:
-        """pose_xy: [B,2], yaw: [B], goal_xy: [B,2] -> command [B,3] (vx,vy,wz)."""
+        """pose_xy: [B,2], yaw: [B], goal_xy: [B,2].
+
+        velocity_state=None (default): returns the instantaneous body
+        velocity command [B,3] (vx,vy,wz), as before.
+
+        velocity_state given ([B,3] current body velocity) along with dt:
+        returns the NEXT velocity state [B,3] (this call's P-law output is
+        hard-clipped to an acceleration and integrated into velocity_state
+        -- see class docstring). The caller uses the return value as both
+        the new state to carry forward and the nominal command for this
+        step.
+        """
         error_xy = goal_xy - pose_xy
         yaw_ref = torch.atan2(error_xy[:, 1], error_xy[:, 0])
         raw_yaw_error = yaw_ref - yaw
@@ -226,8 +309,14 @@ class BatchedGoToGoalController:
         # R(theta)^T @ [desired_x, desired_y]
         command_x = c * desired_x + s * desired_y
         command_y = -s * desired_x + c * desired_y
-        command = torch.stack((command_x, command_y, desired_yaw), dim=-1)
-        return torch.clamp(command, self.min_cmd, self.max_cmd)
+        raw = torch.stack((command_x, command_y, desired_yaw), dim=-1)
+
+        if velocity_state is None:
+            return torch.clamp(raw, self.min_cmd, self.max_cmd)
+
+        assert dt is not None, "dt is required when velocity_state is given."
+        accel = torch.clamp(raw, self.min_accel, self.max_accel)
+        return velocity_state + accel * dt
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +343,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collision-margin-m", type=float, default=0.05)
     parser.add_argument(
         "--collision-termination-mode", choices=("circle", "seanav_contact"), default="circle",
+    )
+    parser.add_argument(
+        "--filter-type",
+        choices=(
+            "bcbf_lse_qp", "bcbf_lse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted",
+            "safter",
+        ),
+        default="bcbf_lse_qp",
+        help=(
+            "bcbf_lse_qp (default): the no-control-dynamics hard-box filter "
+            "this script is built around -- unchanged inline construction, "
+            "identical behavior to every prior run of this script. "
+            "bcbf_lse_cd_qp: the control-dynamics (velocity-as-state) QP "
+            "counterpart -- same composite LSE barrier/backup/terminal model "
+            "as SAFTER itself, differing only in QP vs analytical synthesis "
+            "-- built via eval_vanilla_filterswap.build_retrofit_filter."
+        ),
     )
     parser.add_argument("--low-level-checkpoint", default=DEFAULT_LOW_CHECKPOINT)
     parser.add_argument("--qp-backend", choices=("active_set", "qpth", "osqp"), default="active_set")
@@ -323,16 +429,30 @@ def evaluate_map(
     )
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
+    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters
+    # -- see evaluate_laser_unseen_maps_structured.evaluate_method_vectorized
+    # for the full rationale.
+    pooled_diag_steps = 0
+    pooled_clip_steps = 0
+    pooled_clip_violation_steps = 0
+    pooled_no_clip_violation_steps = 0
     try:
         verify_compiled_physical_map(raw_env, env, map_name)
 
-        safety_filter = LaserZeroBackupLseQp(
-            **FILTER_SHARED_KWARGS,
-            **FILTER_BACKUP_KWARGS,
-            **FILTER_QP_KWARGS,
-            qp_backend=args.qp_backend,
-            backup_margin=args.backup_margin,
-        )
+        if args.filter_type == "bcbf_lse_qp":
+            safety_filter = LaserZeroBackupLseQp(
+                **FILTER_SHARED_KWARGS,
+                **FILTER_BACKUP_KWARGS,
+                **FILTER_QP_KWARGS,
+                qp_backend=args.qp_backend,
+                backup_margin=args.backup_margin,
+            )
+        else:
+            safety_filter = build_retrofit_filter(
+                args.filter_type, cfg,
+                (FILTER_SHARED_KWARGS["max_vx"], FILTER_SHARED_KWARGS["max_vy"],
+                 FILTER_SHARED_KWARGS["max_wz"], None),
+            )
         controller = BatchedGoToGoalController(device=device)
         dt = float(env.navigation_cfg.high_level_dt)
 
@@ -363,6 +483,15 @@ def evaluate_map(
 
             active_count = len(real_cases)
             finished = [False] * active_count
+            # Velocity STATE for the stateful heuristic P-controller (see
+            # BatchedGoToGoalController's docstring / the module-level
+            # 2026-11-15 follow-up correction) -- reset to rest at the
+            # start of every batch, since each batch_start iteration
+            # assigns a fresh scenario to all `batch_size` envs at once
+            # (env.set_fixed_scenarios above), so there is never a
+            # mid-batch episode handoff within the same env slot to carry
+            # velocity across.
+            velocity_state = torch.zeros(batch_size, 3, device=device, dtype=positions.dtype)
             previous_positions = positions[:active_count].detach().clone()
             path_lengths = [0.0] * active_count
             minimum_clearances = [
@@ -370,6 +499,11 @@ def evaluate_map(
             ]
             active_steps = [0] * active_count
             correction_sums = [0.0] * active_count
+            clip_triggered_steps = [0] * active_count
+            clip_delta_sums = [0.0] * active_count
+            clip_delta_maxes = [0.0] * active_count
+            barrier_violated_post_clip_steps = [0] * active_count
+            residual_exec_mins = [math.inf] * active_count
             returns = [0.0] * active_count
             step_counts = [0] * active_count
 
@@ -377,14 +511,30 @@ def evaluate_map(
                 while not all(finished):
                     pre_positions, pre_yaws = env.safety_context()
                     goal_xy = env.goal_positions
-                    nominal = controller.compute(pre_positions, pre_yaws, goal_xy)
+                    velocity_state = controller.compute(
+                        pre_positions, pre_yaws, goal_xy, velocity_state, dt
+                    )
+                    nominal = velocity_state
 
                     ranges = env.laser_ranges()
                     angles = env.ray_angles
-                    # LaserZeroBackupLseQp has no command-dynamics/velocity-
-                    # state argument -- it decides directly on the commanded
-                    # body velocity -- so these three positions are None.
-                    safety = safety_filter.filter(ranges, angles, None, nominal, None, None)
+                    if args.filter_type == "bcbf_lse_qp":
+                        # LaserZeroBackupLseQp has no command-dynamics/
+                        # velocity-state argument -- it decides directly on
+                        # the commanded body velocity -- so these three
+                        # positions are None.
+                        safety = safety_filter.filter(ranges, angles, None, nominal, None, None)
+                    else:
+                        # bcbf_lse_cd_qp IS a control-dynamics filter: it
+                        # needs the env's own tracked current-safe-command/
+                        # previous-nominal-command/history-valid state, same
+                        # as eval_heuristic_vs_sac_training_maps.py's
+                        # heuristic+safter branch uses (no SAC actor_obs
+                        # exists in this script to source these from).
+                        safety = safety_filter.filter(
+                            ranges, angles, env.previous_safe_command, nominal,
+                            env.previous_nominal_command, env.nominal_history_valid,
+                        )
                     safe = safety.command
 
                     _, reward, done, extras = env.step_safe(nominal, safe, safety)
@@ -424,6 +574,31 @@ def evaluate_map(
                         filter_active = correction_value > 1e-8
                         active_steps[env_id] += int(filter_active)
 
+                        # Reviewer diagnostic: how often the filter's own
+                        # hard clip changes the command, and whether the
+                        # as-executed command still satisfies the CBF
+                        # condition.
+                        clip_delta_flags = getattr(safety, "clip_delta", None)
+                        if clip_delta_flags is not None:
+                            clip_delta_value = float(clip_delta_flags[env_id].detach().cpu())
+                            clip_delta_sums[env_id] += clip_delta_value
+                            clip_delta_maxes[env_id] = max(clip_delta_maxes[env_id], clip_delta_value)
+                        clip_changed_flags = getattr(safety, "clip_changed", None)
+                        if clip_changed_flags is not None:
+                            clip_triggered_steps[env_id] += int(bool(clip_changed_flags[env_id]))
+                        residual_exec_flags = getattr(safety, "residual_exec", None)
+                        if residual_exec_flags is not None:
+                            residual_exec_value = float(residual_exec_flags[env_id].detach().cpu())
+                            is_barrier_violated = residual_exec_value < 0.0
+                            barrier_violated_post_clip_steps[env_id] += int(is_barrier_violated)
+                            residual_exec_mins[env_id] = min(residual_exec_mins[env_id], residual_exec_value)
+                            pooled_diag_steps += 1
+                            if clip_changed_flags is not None and bool(clip_changed_flags[env_id]):
+                                pooled_clip_steps += 1
+                                pooled_clip_violation_steps += int(is_barrier_violated)
+                            else:
+                                pooled_no_clip_violation_steps += int(is_barrier_violated)
+
                         trajectory_row = None
                         if args.log_trajectories:
                             trajectory_row = {
@@ -449,6 +624,17 @@ def evaluate_map(
                                 "safe_vy_mps": float(safe[env_id, 1].detach().cpu()),
                                 "safe_wz_radps": float(safe[env_id, 2].detach().cpu()),
                                 "command_correction_norm": correction_value,
+                                "clip_delta_m_s": (
+                                    float(clip_delta_flags[env_id].detach().cpu())
+                                    if clip_delta_flags is not None else math.nan
+                                ),
+                                "clip_changed": (
+                                    int(bool(clip_changed_flags[env_id])) if clip_changed_flags is not None else 0
+                                ),
+                                "residual_exec": (
+                                    float(residual_exec_flags[env_id].detach().cpu())
+                                    if residual_exec_flags is not None else math.nan
+                                ),
                                 "filter_active": int(filter_active),
                                 "physical_clearance_m": clearance,
                                 "cumulative_path_length_m": path_lengths[env_id],
@@ -516,6 +702,15 @@ def evaluate_map(
                                 "episode_steps": step_counts[env_id],
                                 "minimum_physical_clearance_m": minimum_clearances[env_id],
                                 "filter_active_fraction": active_steps[env_id] / max(step_counts[env_id], 1),
+                                "clip_triggered_fraction": clip_triggered_steps[env_id] / max(step_counts[env_id], 1),
+                                "mean_clip_delta_m_s": clip_delta_sums[env_id] / max(step_counts[env_id], 1),
+                                "max_clip_delta_m_s": clip_delta_maxes[env_id],
+                                "barrier_violated_post_clip_fraction": (
+                                    barrier_violated_post_clip_steps[env_id] / max(step_counts[env_id], 1)
+                                ),
+                                "min_residual_exec": (
+                                    residual_exec_mins[env_id] if math.isfinite(residual_exec_mins[env_id]) else math.nan
+                                ),
                                 "mean_command_correction_norm": (
                                     correction_sums[env_id] / max(step_counts[env_id], 1)
                                 ),
@@ -571,6 +766,27 @@ def evaluate_map(
             ),
             "mean_command_correction_norm": mean(
                 float(row["mean_command_correction_norm"]) for row in records
+            ),
+            "mean_clip_triggered_fraction": mean(
+                float(row["clip_triggered_fraction"]) for row in records
+            ),
+            "mean_clip_delta_m_s": mean(float(row["mean_clip_delta_m_s"]) for row in records),
+            "max_clip_delta_m_s": max(float(row["max_clip_delta_m_s"]) for row in records),
+            "mean_barrier_violated_post_clip_fraction": mean(
+                float(row["barrier_violated_post_clip_fraction"]) for row in records
+            ),
+            "min_residual_exec_overall": min(
+                (float(row["min_residual_exec"]) for row in records if math.isfinite(float(row["min_residual_exec"]))),
+                default=math.nan,
+            ),
+            "pooled_diag_steps": pooled_diag_steps,
+            "pooled_clip_steps": pooled_clip_steps,
+            "pooled_clip_triggered_rate": pooled_clip_steps / max(pooled_diag_steps, 1),
+            "pooled_barrier_violated_given_clip_rate": (
+                pooled_clip_violation_steps / pooled_clip_steps if pooled_clip_steps > 0 else math.nan
+            ),
+            "pooled_barrier_violated_given_no_clip_rate": (
+                pooled_no_clip_violation_steps / max(pooled_diag_steps - pooled_clip_steps, 1)
             ),
         }
         return {"records": records, "trajectory_records": trajectory_records, "summary": summary}
@@ -660,7 +876,13 @@ def load_or_generate_manifest(
 
 
 def main() -> None:
+    global METHOD_NAME
     args = parse_args()
+    if args.filter_type != "bcbf_lse_qp":
+        # Keep the on-disk method name/CSV "method" column honest about which
+        # filter actually ran -- the module-level default name says "nocd"
+        # and would otherwise mislabel a bcbf_lse_cd_qp run.
+        METHOD_NAME = f"heuristic_{args.filter_type}"
     if args.cases_per_seed <= 0 or args.num_seeds <= 0 or args.seed_stride <= 0:
         raise ValueError("--cases-per-seed, --num-seeds, and --seed-stride must be positive.")
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -744,6 +966,18 @@ def main() -> None:
                 ),
                 "mean_command_correction_norm": mean(
                     float(r["mean_command_correction_norm"]) for r in seed_rows
+                ),
+                "mean_clip_triggered_fraction": mean(
+                    float(r["clip_triggered_fraction"]) for r in seed_rows
+                ),
+                "mean_clip_delta_m_s": mean(float(r["mean_clip_delta_m_s"]) for r in seed_rows),
+                "max_clip_delta_m_s": max(float(r["max_clip_delta_m_s"]) for r in seed_rows),
+                "mean_barrier_violated_post_clip_fraction": mean(
+                    float(r["barrier_violated_post_clip_fraction"]) for r in seed_rows
+                ),
+                "min_residual_exec_overall": min(
+                    (float(r["min_residual_exec"]) for r in seed_rows if math.isfinite(float(r["min_residual_exec"]))),
+                    default=math.nan,
                 ),
             }
             write_rows(method_dir / f"{METHOD_NAME}_summary.csv", [seed_summary])

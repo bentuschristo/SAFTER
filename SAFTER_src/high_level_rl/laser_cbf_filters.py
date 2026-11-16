@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .zero_backup_flow import exact_zero_backup_state_and_phi
+from .zero_backup_flow import exact_decaying_target_backup_state_and_phi
 
 
 def _asymmetric_limits(
@@ -1153,8 +1153,18 @@ class LaserScanCbfControlDynamicsClosedForm(_LocalScanPointGeometry):
         limits_lower = torch.as_tensor(self.limits_lower, device=current_command.device, dtype=current_command.dtype)
         limits_upper = torch.as_tensor(self.limits_upper, device=current_command.device, dtype=current_command.dtype)
         command = torch.clamp(command_unclipped, limits_lower, limits_upper) if self.hard_clip_output else command_unclipped
+        clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
         violation = torch.relu(torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)).max(dim=1).values
+
+        # Diagnostic only (see LaserZeroBackupLseCbfClosedForm.filter() for the
+        # original derivation): recover the surrogate that would exactly
+        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
+        # same ZOH update, and the CBF residual at that surrogate -- answers
+        # whether the final hard clip can reintroduce a barrier violation.
+        one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
+        u_hat_exec = (command - decay * current_command) / one_minus_decay
+        residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
 
         return LaserSafetyFilterResult(
             command=command,
@@ -1173,6 +1183,10 @@ class LaserScanCbfControlDynamicsClosedForm(_LocalScanPointGeometry):
             input_bound_active=violation > 1.0e-6,
             projection_feasible=feasible,
             projected_cbf_residual=residual,
+            command_preclip=command_unclipped,
+            clip_delta=clip_delta,
+            clip_changed=clip_delta > 1.0e-7,
+            residual_exec=residual_exec,
         )
 
 
@@ -1453,8 +1467,17 @@ class LaserScanCbfLseControlDynamicsQpCfMatched(LaserScanCbfControlDynamicsClose
             if self.hard_clip_output
             else command_unclipped
         )
+        clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
         feasible = diag.max_violation <= self.projector.feasibility_tol
+
+        # Diagnostic only: CBF residual at the surrogate that would exactly
+        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
+        # same ZOH update (see LaserZeroBackupLseCbfClosedForm.filter()).
+        one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
+        u_hat_exec = (command - decay * current_command) / one_minus_decay
+        residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
+
         return LaserSafetyFilterResult(
             command=command,
             surrogate_command=surrogate,
@@ -1472,6 +1495,10 @@ class LaserScanCbfLseControlDynamicsQpCfMatched(LaserScanCbfControlDynamicsClose
             input_bound_active=violation > 1.0e-6,
             projection_feasible=feasible,
             projected_cbf_residual=(-diag.max_violation).detach(),
+            command_preclip=command_unclipped,
+            clip_delta=clip_delta,
+            clip_changed=clip_delta > 1.0e-7,
+            residual_exec=residual_exec,
         )
 
 
@@ -1508,6 +1535,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         max_wz: float = 0.5,
         min_vx: float | None = None,
         control_dynamics_a: tuple[float, float, float] = (8.0, 8.0, 8.0),
+        backup_target_command: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        backup_intent_decay_rate: float = 2.0,
         tracking_sigma: tuple[float, float, float] = (8.0, 8.0, 8.0),
         integration_dt: float = 0.10,
         robot_length_m: float = 0.70,
@@ -1559,6 +1588,43 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         self.alpha_outer = float(alpha_outer)
         self.limits_lower, self.limits_upper = _asymmetric_limits(max_vx, max_vy, max_wz, min_vx)
         self.a_tuple = tuple(float(x) for x in control_dynamics_a)
+        # Backup-controller intent: a "sidestep-then-stop" generalization of
+        # the historical "coast to a dead stop" backup policy. The augmented
+        # surrogate obeys u_dot = -A (u - u_target(t)) with a backup intent
+        # u_target(t) = backup_target_command * exp(-backup_intent_decay_rate
+        # * t) that itself fades to zero -- so the backup trajectory still
+        # converges to rest (same equilibrium as the original zero backup),
+        # it just takes a detour through a transient sidestep/creep/turn on
+        # the way there. Because the terminal state is still (to within
+        # exp(-decay_rate * backup_horizon_s), exponentially negligible for
+        # the default decay_rate=2.0/horizon=4s) at rest, BOTH existing
+        # terminal sets (legacy_inflated_ellipse, invariant_ellipse) remain
+        # valid unchanged -- this only changes the shape of the backup
+        # trajectory, not the backup set. backup_target_command=(0, 0, 0)
+        # (the default) reproduces the original zero-backup flow bit-for-bit,
+        # regardless of backup_intent_decay_rate.
+        self.backup_target_tuple = tuple(float(x) for x in backup_target_command)
+        if len(self.backup_target_tuple) != 3:
+            raise ValueError("backup_target_command must have exactly 3 entries (vx, vy, wz)")
+        for value, lower, upper, name in zip(
+            self.backup_target_tuple, self.limits_lower, self.limits_upper, ("vx", "vy", "wz")
+        ):
+            if not (lower <= value <= upper):
+                raise ValueError(
+                    f"backup_target_command[{name}]={value} is outside the command "
+                    f"box [{lower}, {upper}] -- the backup policy must command an "
+                    "admissible steady-state velocity"
+                )
+        self.backup_intent_decay_rate = float(backup_intent_decay_rate)
+        if self.backup_intent_decay_rate <= 0.0:
+            raise ValueError("backup_intent_decay_rate must be positive (the intent must decay away)")
+        for rate, name in zip(self.a_tuple, ("vx", "vy", "wz")):
+            if abs(rate - self.backup_intent_decay_rate) < 1.0e-3:
+                raise ValueError(
+                    f"backup_intent_decay_rate={self.backup_intent_decay_rate} is too close to "
+                    f"control_dynamics_a[{name}]={rate} (resonant case, unsupported) -- pick a "
+                    "value further from every control_dynamics_a entry"
+                )
         self.sigma_tuple = tuple(float(x) for x in tracking_sigma)
         self.dt = float(integration_dt)
         self.hard_clip_output = bool(hard_clip_output)
@@ -1592,7 +1658,9 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
             - self.terminal_big_r_y / self.terminal_big_r_x
         )
 
-    def _fhat_and_jacobian(self, z: torch.Tensor, a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _fhat_and_jacobian(
+        self, z: torch.Tensor, a: torch.Tensor, u_target: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B = z.shape[0]
         theta = z[:, 2]
         vx = z[:, 3]
@@ -1605,7 +1673,13 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         f[:, 0] = c * vx - s * vy
         f[:, 1] = s * vx + c * vy
         f[:, 2] = wz
-        f[:, 3:] = -a * z[:, 3:]
+        # Backup-policy dynamics: u_dot = -a * (u - u_target). u_target=None
+        # (the default everywhere except the backup flow's own call sites)
+        # reproduces the original "coast to a dead stop" field exactly.
+        if u_target is None:
+            f[:, 3:] = -a * z[:, 3:]
+        else:
+            f[:, 3:] = -a * (z[:, 3:] - u_target)
 
         F = torch.zeros(B, 6, 6, device=z.device, dtype=z.dtype)
         F[:, 0, 2] = -s * vx - c * vy
@@ -1644,7 +1718,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
             grads[:, 2 * j, 3 + j] = -1.0 / limits_upper[j].abs()
             grads[:, 2 * j + 1, 3 + j] = 1.0 / limits_lower[j].abs()
         z0 = torch.cat((torch.zeros(B, 3, device=current_command.device, dtype=current_command.dtype), current_command), dim=1)
-        fhat0, _ = self._fhat_and_jacobian(z0, a)
+        u_target = torch.as_tensor(self.backup_target_tuple, device=current_command.device, dtype=current_command.dtype)
+        fhat0, _ = self._fhat_and_jacobian(z0, a, u_target)
         lf_terms = torch.sum(grads * fhat0[:, None, :], dim=-1)
         lg_terms = grads[..., 3:] * a[None, None, :]
         h, lf, lg = _softmin_value_lie(terms, lf_terms, lg_terms, self.kappa_input)
@@ -1669,7 +1744,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         a = torch.as_tensor(self.a_tuple, device=current_command.device, dtype=current_command.dtype)
         a_min = torch.clamp(torch.min(a[:2]), min=self.eps)
         z0 = torch.cat((torch.zeros(B, 3, device=current_command.device, dtype=current_command.dtype), current_command), dim=1)
-        fhat0, _ = self._fhat_and_jacobian(z0, a)
+        u_target = torch.as_tensor(self.backup_target_tuple, device=current_command.device, dtype=current_command.dtype)
+        fhat0, _ = self._fhat_and_jacobian(z0, a, u_target)
 
         all_terms: list[torch.Tensor] = []
         all_lf: list[torch.Tensor] = []
@@ -1695,7 +1771,12 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         sample_times = self.backup_horizon_s * torch.arange(
             1, self.backup_samples, device=current_command.device, dtype=current_command.dtype
         ) / float(self.backup_samples - 1)
-        z_t, phi_t = exact_zero_backup_state_and_phi(z0, sample_times, a)  # (B,K,6), (B,K,6,6)
+        intent_decay_rate = torch.as_tensor(
+            self.backup_intent_decay_rate, device=current_command.device, dtype=current_command.dtype
+        )
+        z_t, phi_t = exact_decaying_target_backup_state_and_phi(
+            z0, sample_times, a, u_target, intent_decay_rate
+        )  # (B,K,6), (B,K,6,6)
 
         z_flat = z_t.reshape(B * num_samples, 6)
         points_flat = (
@@ -2237,8 +2318,17 @@ class LaserZeroBackupLseControlDynamicsQpCfMatched(LaserZeroBackupLseCbfClosedFo
             torch.clamp(command_unclipped, limits_lower, limits_upper)
             if self.hard_clip_output else command_unclipped
         )
+        clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
         feasible = diag.max_violation <= self.projector.feasibility_tol
+
+        # Diagnostic only: CBF residual at the surrogate that would exactly
+        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
+        # same ZOH update (see LaserZeroBackupLseCbfClosedForm.filter()).
+        one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
+        u_hat_exec = (command - decay * current_command) / one_minus_decay
+        residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
+
         return LaserSafetyFilterResult(
             command=command,
             surrogate_command=surrogate,
@@ -2256,6 +2346,165 @@ class LaserZeroBackupLseControlDynamicsQpCfMatched(LaserZeroBackupLseCbfClosedFo
             input_bound_active=violation > 1.0e-6,
             projection_feasible=feasible,
             projected_cbf_residual=(-diag.max_violation).detach(),
+            command_preclip=command_unclipped,
+            clip_delta=clip_delta,
+            clip_changed=clip_delta > 1.0e-7,
+            residual_exec=residual_exec,
+        )
+
+
+class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
+    """bCBF-CD-LSE-Adapted: a control-dynamics bCBF-QP filter that combines
+    all safety constraints with a single flat log-sum-exp softmin.
+
+    Every backup-rollout time-sample x LiDAR ray term, every terminal-set
+    term, and all six command-state input-limit terms are stacked together
+    and soft-minned in one pass (sharpness kappa_outer) into a single
+    augmented barrier value, which is then enforced through an exact QP
+    (QpthProjector) over the surrogate command. kappa_backup/kappa_input are
+    accepted (inherited constructor) but unused by this class's filter().
+    """
+
+    def filter(
+        self,
+        ranges: torch.Tensor,
+        angles: torch.Tensor,
+        current_command: torch.Tensor,
+        nominal_command: torch.Tensor,
+        previous_nominal_command: torch.Tensor | None = None,
+        nominal_history_valid: torch.Tensor | None = None,
+    ) -> LaserSafetyFilterResult:
+        B = current_command.shape[0]
+        a = torch.as_tensor(self.a_tuple, device=current_command.device, dtype=current_command.dtype)
+        sigma = torch.as_tensor(
+            self.sigma_tuple, device=current_command.device, dtype=current_command.dtype
+        )
+
+        # Raw (un-aggregated) backup-rollout/terminal terms, so every
+        # individual term survives into this class's single flat LSE below.
+        _, _, _, backup_terms, backup_lf, backup_lg = self._backup_terms_and_lie(
+            ranges, angles, current_command, aggregate=False
+        )
+
+        # Raw (un-aggregated) input-limit terms.
+        limits_lower = torch.as_tensor(
+            self.limits_lower, device=current_command.device, dtype=current_command.dtype
+        )
+        limits_upper = torch.as_tensor(
+            self.limits_upper, device=current_command.device, dtype=current_command.dtype
+        )
+        input_terms = torch.stack(
+            tuple(
+                value
+                for j in range(3)
+                for value in (
+                    (limits_upper[j] - current_command[:, j]) / limits_upper[j].abs(),
+                    (current_command[:, j] - limits_lower[j]) / limits_lower[j].abs(),
+                )
+            ),
+            dim=1,
+        )
+        input_grads = torch.zeros(B, 6, 6, device=current_command.device, dtype=current_command.dtype)
+        for j in range(3):
+            input_grads[:, 2 * j, 3 + j] = -1.0 / limits_upper[j].abs()
+            input_grads[:, 2 * j + 1, 3 + j] = 1.0 / limits_lower[j].abs()
+        z0 = torch.cat(
+            (torch.zeros(B, 3, device=current_command.device, dtype=current_command.dtype), current_command),
+            dim=1,
+        )
+        u_target = torch.as_tensor(
+            self.backup_target_tuple, device=current_command.device, dtype=current_command.dtype
+        )
+        fhat0, _ = self._fhat_and_jacobian(z0, a, u_target)
+        input_lf = torch.sum(input_grads * fhat0[:, None, :], dim=-1)
+        input_lg = input_grads[..., 3:] * a[None, None, :]
+
+        # Single flat soft-min over every backup/terminal and input-limit
+        # term, sharpness kappa_outer.
+        all_terms = torch.cat((backup_terms, input_terms), dim=1)
+        all_lf = torch.cat((backup_lf, input_lf), dim=1)
+        all_lg = torch.cat((backup_lg, input_lg), dim=1)
+        h_aug, lf, lg = _softmin_value_lie(all_terms, all_lf, all_lg, self.kappa_outer)
+
+        if previous_nominal_command is None:
+            previous_nominal_command = nominal_command.detach()
+        if nominal_history_valid is None:
+            valid_history = torch.ones(
+                B, 1, device=current_command.device, dtype=current_command.dtype
+            )
+        else:
+            valid_history = nominal_history_valid.to(
+                device=current_command.device, dtype=current_command.dtype
+            )
+            if valid_history.ndim == 1:
+                valid_history = valid_history[:, None]
+        nominal_derivative = (
+            valid_history * (nominal_command - previous_nominal_command) / max(self.dt, self.eps)
+        )
+        desired_surrogate = (
+            current_command
+            + nominal_derivative / a
+            + (sigma / a) * (nominal_command - current_command)
+        )
+
+        omega = lf + torch.sum(lg * desired_surrogate, dim=1) + self.alpha_outer * h_aug
+        denom = torch.sum(lg.square(), dim=1)
+        needs_correction = omega < 0.0
+        nondegenerate = denom > self.eps
+        degenerate_active = needs_correction & (~nondegenerate)
+        lambda_value = torch.where(
+            needs_correction & nondegenerate,
+            -omega / torch.clamp(denom, min=self.eps),
+            torch.zeros_like(omega),
+        )
+
+        # lf + lg uhat + alpha(h) >= 0  <=>  -lg uhat <= lf + alpha(h).
+        A = -lg[:, None, :]
+        b = (lf + self.alpha_outer * h_aug)[:, None]
+        weights = torch.ones(3, device=current_command.device, dtype=current_command.dtype)
+        qp_surrogate, diag = self.projector.project(desired_surrogate, A, b, weights)
+        surrogate = torch.where(
+            degenerate_active[:, None], torch.zeros_like(qp_surrogate), qp_surrogate
+        )
+
+        decay = torch.exp(-a * self.dt)
+        command_unclipped = decay * current_command + (1.0 - decay) * surrogate
+        violation = torch.relu(
+            torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)
+        ).max(dim=1).values
+        command = (
+            torch.clamp(command_unclipped, limits_lower, limits_upper)
+            if self.hard_clip_output else command_unclipped
+        )
+        clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
+        correction = surrogate - desired_surrogate
+        feasible = diag.max_violation <= self.projector.feasibility_tol
+
+        one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
+        u_hat_exec = (command - decay * current_command) / one_minus_decay
+        residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
+
+        return LaserSafetyFilterResult(
+            command=command,
+            surrogate_command=surrogate,
+            desired_surrogate_command=desired_surrogate,
+            h_lse=h_aug,
+            h_backup_lse=None,
+            h_input_lse=None,
+            individual_h=all_terms,
+            active=needs_correction,
+            correction_norm=torch.linalg.norm(correction, dim=1),
+            cbf_value_nominal=omega,
+            lambda_value=lambda_value,
+            mu_value=torch.zeros_like(h_aug),
+            input_bound_violation=violation,
+            input_bound_active=violation > 1.0e-6,
+            projection_feasible=feasible,
+            projected_cbf_residual=(-diag.max_violation).detach(),
+            command_preclip=command_unclipped,
+            clip_delta=clip_delta,
+            clip_changed=clip_delta > 1.0e-7,
+            residual_exec=residual_exec,
         )
 
 
@@ -2672,8 +2921,16 @@ class LaserZeroBackupLseQp(LaserScanCbfLseQp):
             torch.clamp(command_unclipped, limits_lower, limits_upper)
             if self.hard_clip_output else command_unclipped
         )
+        clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = command_unclipped - nominal_command
         feasible = diag.max_violation <= self.projector.feasibility_tol
+
+        # Diagnostic only: CBF condition re-evaluated at the ACTUALLY
+        # EXECUTED (post-clip) command `u` directly -- no ZOH/surrogate
+        # inversion needed here since this filter has no command-dynamics
+        # state (the QP decision variable already IS the applied command).
+        residual_exec = self.alpha * h_backup + torch.sum(lg_backup * command, dim=1)
+
         return LaserSafetyFilterResult(
             command=command,
             surrogate_command=command_unclipped,
@@ -2689,4 +2946,8 @@ class LaserZeroBackupLseQp(LaserScanCbfLseQp):
             input_bound_active=violation > 1.0e-6,
             projection_feasible=feasible,
             projected_cbf_residual=(-diag.max_violation).detach(),
+            command_preclip=command_unclipped,
+            clip_delta=clip_delta,
+            clip_changed=clip_delta > 1.0e-7,
+            residual_exec=residual_exec,
         )

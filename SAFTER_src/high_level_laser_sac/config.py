@@ -45,12 +45,24 @@ class SacHyperparameters:
     log_std_min: float = -5.0
     log_std_max: float = 2.0
     gradient_clip_norm: float = 10.0
+    # When True, the critic additionally conditions on the CURRENT-step
+    # nominal (pre-filter) action, alongside the usual (obs, safe_action)
+    # pair -- not just the one-step-stale previous_nominal_command already
+    # baked into obs. False (default) reproduces every existing checkpoint's
+    # critic architecture exactly (obs_dim+action_dim input, unchanged). See
+    # TwinQCritic's extra_action_dim and VectorReplayBuffer's nominal_action
+    # field, both no-ops when this is False.
+    critic_sees_nominal_action: bool = False
 
 
 LaserSacMethod = Literal[
     "vanilla", "cbf_cf_clip", "cbf_qp", "cbf_lse_qp",
     "cbf_cd_cf", "cbf_lse_cd_qp", "bcbf_cf", "bcbf_qp", "bcbf_lse_cd_qp",
     "bcbf_nonlse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "cbf_lse_cd_qp_cfmatched",
+    # Control-dynamics bCBF-QP filter combining all constraints with a
+    # single flat softmin. See LaserZeroBackupCdLseAdapted in
+    # laser_cbf_filters.py.
+    "bcbf_cd_lse_adapted",
     # Zero-backup LSE-aggregated QP WITHOUT control dynamics: the decision
     # variable is the directly-applied body command (no first-order command-
     # state surrogate), backup law is exactly zero velocity (kinematic flow,
@@ -293,6 +305,16 @@ class LaserSafetyConfig:
     legacy_projection: bool = True
 
     control_dynamics_a: tuple[float, float, float] = (8.0, 8.0, 8.0)
+    # bcbf_cf-only "sidestep-then-stop" backup controller generalization.
+    # Nonzero entries make the backup policy transiently coast toward this
+    # commanded velocity before its own intent decays away (rate
+    # backup_intent_decay_rate) and the trajectory settles back to rest, same
+    # as the original zero-backup policy -- so the terminal set(s) above stay
+    # valid unchanged. (0, 0, 0) (the default) reproduces the original
+    # zero-backup flow bit-for-bit. See LaserZeroBackupLseCbfClosedForm /
+    # exact_decaying_target_backup_state_and_phi.
+    backup_target_command: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    backup_intent_decay_rate: float = 2.0
     tracking_sigma: tuple[float, float, float] = (8.0, 8.0, 8.0)
     # Matches the 10 Hz high-level policy/filter update interval.
     integration_dt: float = 0.10
