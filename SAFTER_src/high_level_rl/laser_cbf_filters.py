@@ -2354,98 +2354,84 @@ class LaserZeroBackupLseControlDynamicsQpCfMatched(LaserZeroBackupLseCbfClosedFo
 
 
 class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
-    """bCBF-CD-LSE-Adapted: a control-dynamics bCBF-QP filter that combines
-    all safety constraints with a single flat log-sum-exp softmin.
+    """bCBF-CD-LSE-Adapted: a control-dynamics bCBF-QP filter with an
+    explicit admissible-input-set QP, matching Rabiee & Hoagg's formulation.
 
-    Every backup-rollout time-sample x LiDAR ray term, every terminal-set
-    term, and all six command-state input-limit terms are stacked together
-    and soft-minned in one pass (sharpness kappa_outer) into a single
-    augmented barrier value, which is then enforced through an exact QP
-    (QpthProjector) over the surrogate command. kappa_backup/kappa_input are
-    accepted (inherited constructor) but unused by this class's filter().
+    Unlike its LaserZeroBackupLseControlDynamicsQpCfMatched parent (which
+    takes the previously *executed* command as its command-dynamics state,
+    implicitly assuming the low-level policy tracks commands perfectly),
+    this class's state is the robot's measured body velocity
+    [vx, vy, wz] -- the dot v = -A v + A u_cmd model is evaluated against
+    the actual plant state, not a command-tracking surrogate for it.
+
+    Every backup-rollout time-sample x LiDAR ray term and every
+    terminal-set term are stacked together and soft-minned in one pass
+    (sharpness kappa_outer) into a single barrier row, enforced through an
+    exact QP (QpthProjector) over the surrogate command. The six velocity-
+    state input limits are NOT folded into that barrier/softmin -- they are
+    separate hard box constraints on the surrogate decision variable itself
+    (surrogate in [limits_lower, limits_upper]), so the admissible input set
+    is exact rather than approximated through a barrier margin. kappa_backup/
+    kappa_input/tracking_sigma are accepted (inherited constructor) but
+    unused by this class's filter().
+
+    The QP's unconstrained target is the nominal command itself, not the
+    sigma/feedforward-shaped surrogate the command-as-state parent uses. That
+    shaping exists there to counter a SECOND, virtual lag between the
+    command-history state and the real plant; it doesn't apply here, where
+    the state already IS the real plant velocity, and dot v = -a(v - u_cmd)
+    is the one real physical lag. Commanding u_cmd = nominal directly is the
+    minimal choice that reproduces exactly that single physical lag with no
+    extra filtering layered on top, matching the "project nominal, subject
+    to safety" convention every non-control-dynamics filter in this file
+    already uses.
     """
 
     def filter(
         self,
         ranges: torch.Tensor,
         angles: torch.Tensor,
-        current_command: torch.Tensor,
+        measured_velocity: torch.Tensor,
         nominal_command: torch.Tensor,
         previous_nominal_command: torch.Tensor | None = None,
         nominal_history_valid: torch.Tensor | None = None,
     ) -> LaserSafetyFilterResult:
-        B = current_command.shape[0]
-        a = torch.as_tensor(self.a_tuple, device=current_command.device, dtype=current_command.dtype)
-        sigma = torch.as_tensor(
-            self.sigma_tuple, device=current_command.device, dtype=current_command.dtype
-        )
+        # Accepted only for call-signature compatibility with every other
+        # control-dynamics filter -- unused here, see class docstring.
+        del previous_nominal_command, nominal_history_valid
+        B = measured_velocity.shape[0]
 
-        # Raw (un-aggregated) backup-rollout/terminal terms, so every
-        # individual term survives into this class's single flat LSE below.
+        # Raw (un-aggregated) backup-rollout/terminal terms, soft-minned
+        # (kappa_outer) into the QP's single barrier row.
         _, _, _, backup_terms, backup_lf, backup_lg = self._backup_terms_and_lie(
-            ranges, angles, current_command, aggregate=False
+            ranges, angles, measured_velocity, aggregate=False
         )
+        h_aug, lf, lg = _softmin_value_lie(backup_terms, backup_lf, backup_lg, self.kappa_outer)
 
-        # Raw (un-aggregated) input-limit terms.
         limits_lower = torch.as_tensor(
-            self.limits_lower, device=current_command.device, dtype=current_command.dtype
+            self.limits_lower, device=measured_velocity.device, dtype=measured_velocity.dtype
         )
         limits_upper = torch.as_tensor(
-            self.limits_upper, device=current_command.device, dtype=current_command.dtype
+            self.limits_upper, device=measured_velocity.device, dtype=measured_velocity.dtype
         )
+        # Diagnostic only (not fed into the QP): how close the CURRENT
+        # measured velocity already is to the box.
         input_terms = torch.stack(
             tuple(
                 value
                 for j in range(3)
                 for value in (
-                    (limits_upper[j] - current_command[:, j]) / limits_upper[j].abs(),
-                    (current_command[:, j] - limits_lower[j]) / limits_lower[j].abs(),
+                    (limits_upper[j] - measured_velocity[:, j]) / limits_upper[j].abs(),
+                    (measured_velocity[:, j] - limits_lower[j]) / limits_lower[j].abs(),
                 )
             ),
             dim=1,
         )
-        input_grads = torch.zeros(B, 6, 6, device=current_command.device, dtype=current_command.dtype)
-        for j in range(3):
-            input_grads[:, 2 * j, 3 + j] = -1.0 / limits_upper[j].abs()
-            input_grads[:, 2 * j + 1, 3 + j] = 1.0 / limits_lower[j].abs()
-        z0 = torch.cat(
-            (torch.zeros(B, 3, device=current_command.device, dtype=current_command.dtype), current_command),
-            dim=1,
-        )
-        u_target = torch.as_tensor(
-            self.backup_target_tuple, device=current_command.device, dtype=current_command.dtype
-        )
-        fhat0, _ = self._fhat_and_jacobian(z0, a, u_target)
-        input_lf = torch.sum(input_grads * fhat0[:, None, :], dim=-1)
-        input_lg = input_grads[..., 3:] * a[None, None, :]
 
-        # Single flat soft-min over every backup/terminal and input-limit
-        # term, sharpness kappa_outer.
-        all_terms = torch.cat((backup_terms, input_terms), dim=1)
-        all_lf = torch.cat((backup_lf, input_lf), dim=1)
-        all_lg = torch.cat((backup_lg, input_lg), dim=1)
-        h_aug, lf, lg = _softmin_value_lie(all_terms, all_lf, all_lg, self.kappa_outer)
-
-        if previous_nominal_command is None:
-            previous_nominal_command = nominal_command.detach()
-        if nominal_history_valid is None:
-            valid_history = torch.ones(
-                B, 1, device=current_command.device, dtype=current_command.dtype
-            )
-        else:
-            valid_history = nominal_history_valid.to(
-                device=current_command.device, dtype=current_command.dtype
-            )
-            if valid_history.ndim == 1:
-                valid_history = valid_history[:, None]
-        nominal_derivative = (
-            valid_history * (nominal_command - previous_nominal_command) / max(self.dt, self.eps)
-        )
-        desired_surrogate = (
-            current_command
-            + nominal_derivative / a
-            + (sigma / a) * (nominal_command - current_command)
-        )
+        # The QP's unconstrained target is simply the nominal command --
+        # see class docstring for why no sigma/feedforward shaping belongs
+        # here once the state is the real plant velocity.
+        desired_surrogate = nominal_command
 
         omega = lf + torch.sum(lg * desired_surrogate, dim=1) + self.alpha_outer * h_aug
         denom = torch.sum(lg.square(), dim=1)
@@ -2458,17 +2444,53 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
             torch.zeros_like(omega),
         )
 
-        # lf + lg uhat + alpha(h) >= 0  <=>  -lg uhat <= lf + alpha(h).
-        A = -lg[:, None, :]
-        b = (lf + self.alpha_outer * h_aug)[:, None]
-        weights = torch.ones(3, device=current_command.device, dtype=current_command.dtype)
+        # Row 0: lf + lg uhat + alpha(h) >= 0  <=>  -lg uhat <= lf + alpha(h).
+        barrier_A = -lg[:, None, :]
+        barrier_b = (lf + self.alpha_outer * h_aug)[:, None]
+        # The "active-but-degenerate" case (||Lg h_aug||^2 ~ 0 while still
+        # needing correction) always gets its surrogate overridden to zero
+        # below, regardless of what the solver returns for it. Feeding qpth
+        # the TRUE row for those envs -- an all-zero-gradient row paired
+        # with an already-violated (negative) margin -- makes that single
+        # row unsatisfiable by any u, independent of the box rows, which can
+        # make the batched KKT factorization pathologically slow or hang for
+        # the WHOLE batch, not just the degenerate envs. Since its answer is
+        # discarded anyway, replace that row with an inert, always-satisfied
+        # one (A=0, b=+large) for exactly those envs before the solve, so
+        # the solver is never handed a row with no solution.
+        degenerate_row_mask = degenerate_active[:, None, None]
+        barrier_A = torch.where(degenerate_row_mask, torch.zeros_like(barrier_A), barrier_A)
+        barrier_b = torch.where(
+            degenerate_active[:, None], torch.full_like(barrier_b, 1.0e6), barrier_b
+        )
+        # Rows 1-6: exact box constraint on the surrogate decision variable
+        # itself -- surrogate_j <= upper_j and -surrogate_j <= -lower_j for
+        # each axis j -- independent of any barrier/alpha/kappa choice.
+        eye3 = torch.eye(3, device=measured_velocity.device, dtype=measured_velocity.dtype)
+        box_A = torch.stack(
+            tuple(row for j in range(3) for row in (eye3[j], -eye3[j])), dim=0
+        )[None, :, :].expand(B, -1, -1)
+        box_b = torch.stack(
+            tuple(value for j in range(3) for value in (limits_upper[j], -limits_lower[j]))
+        )[None, :].expand(B, -1)
+        A = torch.cat((barrier_A, box_A), dim=1)
+        b = torch.cat((barrier_b, box_b), dim=1)
+        weights = torch.ones(3, device=measured_velocity.device, dtype=measured_velocity.dtype)
         qp_surrogate, diag = self.projector.project(desired_surrogate, A, b, weights)
         surrogate = torch.where(
             degenerate_active[:, None], torch.zeros_like(qp_surrogate), qp_surrogate
         )
 
-        decay = torch.exp(-a * self.dt)
-        command_unclipped = decay * current_command + (1.0 - decay) * surrogate
+        # surrogate IS the velocity command u_cmd to execute. measured_velocity
+        # is the real plant's own state, not something this filter sets, so
+        # there is no "blend toward the surrogate" step here the way the
+        # command-as-state parent has -- there, that blend WAS the state's
+        # own update rule, so the blended value and the executed command
+        # were the same quantity by construction. Executing anything other
+        # than the solved surrogate directly (e.g. blending in the stale
+        # measured state) can violate the very bound/barrier the QP just
+        # enforced on u_cmd itself.
+        command_unclipped = surrogate
         violation = torch.relu(
             torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)
         ).max(dim=1).values
@@ -2478,20 +2500,30 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
         )
         clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
-        feasible = diag.max_violation <= self.projector.feasibility_tol
+        # The solver only ever sees the degenerate row after it has been
+        # masked to an inert placeholder above, so its own feasibility
+        # diagnostics describe that MODIFIED (box-only) problem for those
+        # envs, not the true one. The true barrier row for every
+        # degenerate_active env is unsatisfiable by any u, independent of
+        # the box, by construction of that branch -- never report those as
+        # feasible regardless of what the masked solve says.
+        feasible = (diag.max_violation <= self.projector.feasibility_tol) & (~degenerate_active)
 
-        one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
-        u_hat_exec = (command - decay * current_command) / one_minus_decay
-        residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
+        # The CBF residual at the command actually executed, using the TRUE
+        # (unmasked) barrier Lie derivatives -- distinct from
+        # projected_cbf_residual below, which is the QP solver's own slack
+        # over whatever rows it was actually handed (box-only, for
+        # degenerate envs), mixing barrier and box slack together.
+        residual_exec = lf + torch.sum(lg * command, dim=1) + self.alpha_outer * h_aug
 
         return LaserSafetyFilterResult(
             command=command,
             surrogate_command=surrogate,
             desired_surrogate_command=desired_surrogate,
             h_lse=h_aug,
-            h_backup_lse=None,
-            h_input_lse=None,
-            individual_h=all_terms,
+            h_backup_lse=h_aug,
+            h_input_lse=input_terms.min(dim=1).values,
+            individual_h=torch.cat((backup_terms, input_terms), dim=1),
             active=needs_correction,
             correction_norm=torch.linalg.norm(correction, dim=1),
             cbf_value_nominal=omega,
