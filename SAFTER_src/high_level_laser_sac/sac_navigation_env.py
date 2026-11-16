@@ -556,6 +556,13 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         pos, _, _, _, _, _, yaw = self._root_state()
         return pos[:, :2].clone(), yaw.clone()
 
+    def measured_velocity(self) -> torch.Tensor:
+        """Body-frame planar velocity [vx, vy, wz] measured from the sim
+        root state -- distinct from previous_safe_command, which is the
+        previously *executed* command, not a direct velocity measurement."""
+        _, _, vel_b, ang_b, _, _, _ = self._root_state()
+        return torch.cat((vel_b[:, :2], ang_b[:, 2:3]), dim=-1).clone()
+
     def _laser_sensor(self):
         try:
             return self.unwrapped.scene[self.laser_obs_cfg.sensor_name]

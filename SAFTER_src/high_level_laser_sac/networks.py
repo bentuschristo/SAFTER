@@ -413,10 +413,15 @@ class LaserSafeSacActor(nn.Module):
             safety = self.safety_filter.filter(ranges, angles, nominal_command)
             command = safety.command
         else:
+            # bcbf_cd_lse_adapted's command-dynamics state is the robot's
+            # measured body velocity (obs[:, 2:5]), not the previously
+            # executed command (obs[:, 5:8]) the other control-dynamics
+            # filters use -- see LaserZeroBackupCdLseAdapted's docstring.
+            command_state = obs[:, 2:5] if self.method == "bcbf_cd_lse_adapted" else obs[:, 5:8]
             safety = self.safety_filter.filter(
                 ranges,
                 angles,
-                obs[:, 5:8],
+                command_state,
                 nominal_command,
                 obs[:, -4:-1],
                 obs[:, -1:],
