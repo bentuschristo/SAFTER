@@ -98,9 +98,7 @@ those — this is intentional, not leftover coupling to clean up.
 (except the two cross-imports noted above), `src/high_level_rl/bcbf_lse_cf_filter.py`,
 `src/high_level_rl/cbf_cd_lse_cf_filter.py`, and every `scripts/*bcbf_sac*`,
 `scripts/*cbf_rl*`, `scripts/train_high_level_rl.py`,
-`scripts/play_high_level_rl.py` entrypoint. Also `scripts/test_bcbf_filter.py`
-and `scripts/test_cf_matched_qp_regression.py` despite similar-sounding
-names — both test the map-based filter, not the laser one.
+`scripts/play_high_level_rl.py` entrypoint.
 
 The many other `scripts/*.sh`/`*.py` files not mentioned above (dozens of
 one-off exploratory eval variants, e.g.
