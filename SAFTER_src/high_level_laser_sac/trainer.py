@@ -40,12 +40,8 @@ class LaserSacTrainer:
         "timeout": "timeout_rate",
         "curriculum": "curriculum_truncation_rate",
     }
-    # Exact tag names used by the v4 SAC-based methods' 100-episode window
-    # (Train/mean_episode_return_100, Train/episode_success_rate_100, etc.),
-    # reused verbatim here so both trainers' curves overlay as the same chart
-    # when their logs are loaded into one TensorBoard instance. timeout/
-    # curriculum have no v4 equivalent (v4 doesn't track those outcomes), so
-    # they extend the same "episode_..._rate_100" pattern.
+    # 100-episode window tag names, shared with the other SAC trainers so their
+    # TensorBoard curves overlay.
     ROLLING_100_TAGS = {
         "return": "mean_episode_return_100",
         "length": "mean_episode_length_100",
@@ -82,13 +78,17 @@ class LaserSacTrainer:
             log_std_max=hp.log_std_max,
             min_vx=nav.action.min_vx,
         ).to(self.device)
-        self.critic = TwinQCritic(obs_dim, 3, hp.hidden_dims).to(self.device)
+        self.critic_sees_nominal_action = bool(hp.critic_sees_nominal_action)
+        critic_extra_action_dim = 3 if self.critic_sees_nominal_action else 0
+        self.critic = TwinQCritic(obs_dim, 3, hp.hidden_dims, critic_extra_action_dim).to(self.device)
         self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=hp.actor_lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=hp.critic_lr)
         self.log_alpha = nn.Parameter(torch.tensor(0.0, device=self.device))
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=hp.alpha_lr)
-        self.buffer = VectorReplayBuffer(hp.replay_size, obs_dim, 3, self.device)
+        self.buffer = VectorReplayBuffer(
+            hp.replay_size, obs_dim, 3, self.device, nominal_action_dim=critic_extra_action_dim
+        )
         self.global_step = 0
         self.vector_step = 0
         self.gradient_step = 0
@@ -104,15 +104,12 @@ class LaserSacTrainer:
             name: deque(maxlen=self.ROLLING_EPISODES) for name in
             ("return", "length", "success", "collision", "timeout", "curriculum")
         }
-        # Additional 100-episode window, matching the v4 SAC-based methods'
-        # convention, logged alongside (not instead of) the 1000-episode one.
+        # 100-episode window, logged alongside the 1000-episode one.
         self.rolling_100 = {name: deque(maxlen=100) for name in self.rolling}
-        # Interval buffers contain every episode completed since the previous
-        # log.  Unlike a bounded deque, a synchronized vector-env completion
-        # batch can never discard its lower-index environments.
+        # Every episode completed since the previous log (unbounded, so a
+        # synchronized batch of completions is never truncated).
         self.interval_episodes = {name: [] for name in self.rolling}
-        # Accumulate every optimizer result between log records instead of
-        # reporting only the final minibatch update.
+        # All optimizer results between log records.
         self.interval_updates: dict[str, list[float]] = {}
         self.collision_rolling = {
             name: deque(maxlen=100) for name in (
@@ -124,8 +121,7 @@ class LaserSacTrainer:
         self.collision_history_steps = int(cfg.collision_trajectory_history_steps)
         if self.collision_history_steps <= 0:
             raise ValueError("collision_trajectory_history_steps must be positive")
-        # Older server checkpoints/configs predate update_every_steps and
-        # performed optimizer updates every vector step.
+        # Configs without update_every_steps update every vector step.
         self.update_every_steps = int(getattr(hp, "update_every_steps", 1))
         if self.update_every_steps <= 0:
             raise ValueError("update_every_steps must be positive")
@@ -133,16 +129,9 @@ class LaserSacTrainer:
         self._collision_history_write = 0
         self._collision_history_samples = 0
 
-        # --- Optional bCBF invariant-ellipse training-time diagnostics ---
-        # (2026-09-07). Purely additive: derived only from fields the safety
-        # filter already returns (safety.individual_h, .cbf_value_nominal,
-        # .correction_norm, .active, .projection_feasible) plus the single
-        # new diagnostic-only field safety.lg_aug_sq_norm -- nothing here is
-        # read by the RL update or fed back into `command`. Off by default;
-        # enabled via train(enable_bcbf_diagnostics=True). Only meaningful
-        # for method="bcbf_cf" with terminal_backup_mode="invariant_ellipse"
-        # (the legacy mode and the QP variants don't populate
-        # lg_aug_sq_norm / don't have the same individual_h column layout).
+        # Optional bCBF diagnostics (train(enable_bcbf_diagnostics=True)); read
+        # only, never fed back into the update or the command. Available for
+        # bcbf_cf with the invariant-ellipse terminal set.
         self._bcbf_diag_ready = (
             self.cfg.method == "bcbf_cf"
             and getattr(self.actor.safety_filter, "terminal_backup_mode", None) == "invariant_ellipse"
@@ -254,10 +243,7 @@ class LaserSacTrainer:
         print()
 
     def _soft_update(self) -> None:
-        # See SacHyperparameters.reference_dt: preserves the effective
-        # per-second target-tracking rate across different high_level_dt
-        # settings rather than applying the archived-10Hz-calibrated tau
-        # 5x more (or less) often per second of simulated time than intended.
+        # Rate-independent tau (see SacHyperparameters.reference_dt).
         dt_scale = float(self.cfg.navigation.high_level_dt) / float(self.cfg.sac.reference_dt)
         tau = 1.0 - (1.0 - self.cfg.sac.tau) ** dt_scale
         with torch.no_grad():
@@ -348,21 +334,18 @@ class LaserSacTrainer:
     def update(self) -> dict[str, float]:
         hp = self.cfg.sac
         batch = self.buffer.sample(hp.batch_size)
-        # See SacHyperparameters.reference_dt: preserves the effective
-        # per-second discounting (and hence real-time planning horizon)
-        # across different high_level_dt settings, rather than silently
-        # compounding the archived-10Hz-calibrated gamma once per decision
-        # regardless of how much real time that decision now spans.
+        # Rate-independent gamma (see SacHyperparameters.reference_dt).
         dt_scale = float(self.cfg.navigation.high_level_dt) / float(hp.reference_dt)
         gamma = hp.gamma ** dt_scale
 
         with torch.no_grad():
             next_out = self.actor.sample(batch.next_obs)
-            target_q1, target_q2 = self.target_critic(batch.next_obs, next_out.safe_normalized)
+            next_extra = next_out.nominal_normalized if self.critic_sees_nominal_action else None
+            target_q1, target_q2 = self.target_critic(batch.next_obs, next_out.safe_normalized, next_extra)
             target_v = torch.minimum(target_q1, target_q2) - self.alpha.detach() * next_out.log_prob
             target = batch.reward + (1.0 - batch.done) * gamma * target_v
 
-        q1, q2 = self.critic(batch.obs, batch.action)
+        q1, q2 = self.critic(batch.obs, batch.action, batch.nominal_action)
         with torch.no_grad():
             td_error_q1 = (q1 - target).abs().mean()
             td_error_q2 = (q2 - target).abs().mean()
@@ -376,7 +359,8 @@ class LaserSacTrainer:
             parameter.requires_grad_(False)
         try:
             actor_out = self.actor.sample(batch.obs)
-            actor_q1, actor_q2 = self.critic(batch.obs, actor_out.safe_normalized)
+            actor_extra = actor_out.nominal_normalized if self.critic_sees_nominal_action else None
+            actor_q1, actor_q2 = self.critic(batch.obs, actor_out.safe_normalized, actor_extra)
             actor_q = torch.minimum(actor_q1, actor_q2)
             actor_loss = (self.alpha.detach() * actor_out.log_prob - actor_q).mean()
             self.actor_opt.zero_grad(set_to_none=True)
@@ -515,16 +499,12 @@ class LaserSacTrainer:
             mismatches.append(f"method: checkpoint={saved_method}, current={self.cfg.method}")
         if saved_laser != current_laser:
             mismatches.append("complete LiDAR configuration differs")
-        # Network/optimizer shapes and learning semantics must match exactly on
-        # resume. In particular, an original (512,256,128) checkpoint cannot be
-        # loaded into the wider (512,512,256) capacity experiment.
+        # Network shapes and learning semantics must match exactly on resume.
         for section in ("navigation", "reward", "safety", "collision_initialization", "sac"):
             saved_section = saved_cfg.get(section)
             current_section = asdict(self.cfg).get(section)
-            # Logger-v5 checkpoints created before the SEA-Nav experiment do
-            # not contain the newly added reward-profile fields. They are
-            # semantically the original profile, so fill only missing keys
-            # from the current original configuration before comparison.
+            # Checkpoints without the reward-profile fields use the original
+            # profile; fill only the missing keys before comparing.
             if (
                 section == "reward"
                 and isinstance(saved_section, dict)
@@ -535,15 +515,8 @@ class LaserSacTrainer:
                     key: saved_section.get(key, value)
                     for key, value in current_section.items()
                 }
-            # v6 checkpoints created before the invariant-ellipse terminal-set
-            # change do not contain terminal_backup_mode/terminal_geom_scale/
-            # terminal_rec_scale. Those default to the old legacy behavior
-            # (terminal_backup_mode="legacy_inflated_ellipse", scales=1.0), so
-            # a checkpoint missing them is semantically unchanged -- fill only
-            # missing keys from the current configuration before comparing,
-            # same pattern as the reward-profile fill-in above. A checkpoint
-            # that DOES record these keys with a different value still
-            # correctly reports a mismatch.
+            # Safety fields missing from a checkpoint are filled from the current
+            # configuration; recorded values that differ still mismatch.
             if (
                 section == "safety"
                 and isinstance(saved_section, dict)
@@ -574,11 +547,8 @@ class LaserSacTrainer:
              allow_curriculum_replan: bool = False) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self._check_checkpoint_compatibility(checkpoint, path)
-        # action_scale (old symmetric-only buffer) was replaced by
-        # action_low/action_high/action_center/action_half_range; both are
-        # derived purely from config, never learned, so a legacy checkpoint's
-        # saved value is dropped rather than loaded -- the freshly
-        # constructed actor already computed the correct buffers.
+        # Action-range buffers are derived from config, so a saved action_scale
+        # buffer is ignored.
         actor_state_dict = dict(checkpoint["actor"])
         actor_state_dict.pop("action_scale", None)
         for buffer_name in ("action_low", "action_high", "action_center", "action_half_range"):
@@ -627,8 +597,7 @@ class LaserSacTrainer:
         for name, values in checkpoint.get("rolling_episode_windows", {}).items():
             if name in self.rolling:
                 self.rolling[name].extend(values[-self.ROLLING_EPISODES:])
-        # Older checkpoints predate this window; resuming one just starts
-        # rolling_100 empty and it refills naturally within 100 episodes.
+        # Missing in some checkpoints; the window then refills within 100 episodes.
         for name, values in checkpoint.get("rolling_episode_windows_100", {}).items():
             if name in self.rolling_100:
                 self.rolling_100[name].extend(values[-100:])
@@ -675,13 +644,8 @@ class LaserSacTrainer:
     def _reset_bcbf_diag_accumulators(self) -> None:
         """(Re)zero the GPU-resident bCBF diagnostic accumulators.
 
-        Called once at construction and again after every flush. Every
-        accumulator here is a 0-d GPU tensor updated in place with plain
-        tensor ops (min/sum/comparison) -- no ``.item()``/``.cpu()`` call
-        appears until ``_flush_bcbf_diag`` runs, so accumulating every
-        control step adds no extra host<->device synchronization on the hot
-        path (see task instructions: "avoid synchronizing GPU tensors every
-        control step unnecessarily").
+        The accumulators are 0-d GPU tensors updated in place, so no host sync
+        happens until ``_flush_bcbf_diag``.
         """
         d = self.device
         self._diag_min_g = torch.tensor(float("inf"), device=d)
@@ -699,19 +663,15 @@ class LaserSacTrainer:
         self._diag_count_nan_inf = torch.zeros((), dtype=torch.long, device=d)
         self._diag_count_fallback = torch.zeros((), dtype=torch.long, device=d)
         self._diag_env_steps = 0
-        # Initial-feasibility check (theorem assumption: h_aug(z0) >= 0 at a
-        # fresh reset) and post-filter consistency check (does hard_clip_
-        # output actually change the filtered action, and by how much).
+        # Initial feasibility (h_aug(z0) >= 0 at reset) and how much the hard
+        # clip changes the filtered action.
         self._diag_sum_h_aug_reset = torch.zeros((), device=d)
         self._diag_count_h_aug_reset_negative = torch.zeros((), dtype=torch.long, device=d)
         self._diag_reset_count = torch.zeros((), dtype=torch.long, device=d)
         self._diag_sum_clip_norm = torch.zeros((), device=d)
         self._diag_count_clip_changed = torch.zeros((), dtype=torch.long, device=d)
-        # ZOH-consistent joint box+half-space projection diagnostics
-        # (2026-09 hard-clip-consistency fix, Tasks 3/5). All read from
-        # LaserSafetyFilterResult fields that are None for older filters, so
-        # they simply stay unpopulated (flush guards on `n>0` count) for any
-        # non-bcbf_cf method.
+        # Joint box + half-space projection diagnostics; fields stay empty for
+        # filters that do not populate them.
         self._diag_count_joint_infeasible = torch.zeros((), dtype=torch.long, device=d)
         self._diag_min_residual_preclip = torch.tensor(float("inf"), device=d)
         self._diag_min_residual_exec = torch.tensor(float("inf"), device=d)
@@ -721,10 +681,8 @@ class LaserSacTrainer:
     def _accumulate_bcbf_diag(
         self, safety: "LaserSafetyFilterResult", just_reset_mask: torch.Tensor | None = None,
     ) -> None:
-        """One step of GPU-only accumulation. See _reset_bcbf_diag_accumulators
-        for the no-extra-sync rationale. Column layout matches
-        `_backup_terms_and_lie` exactly: individual_h = cat(psi(R),
-        h_future(num_samples*R), h_B_geom(R), h_B_rec(R), input_terms(6))."""
+        """One step of GPU-only accumulation. individual_h columns are
+        cat(psi(R), h_future(num_samples*R), h_B_geom(R), h_B_rec(R), input_terms(6))."""
         sf = self.actor.safety_filter
         num_rays = self.actor.num_rays
         num_samples = sf.backup_samples - 1
@@ -741,9 +699,7 @@ class LaserSacTrainer:
         self._diag_count_daug_1e8 += torch.count_nonzero(d_aug < 1.0e-8)
         self._diag_count_daug_1e6 += torch.count_nonzero(d_aug < 1.0e-6)
 
-        # E_i = exp(2 g_i); exp is monotonic so thresholding E_i is equivalent
-        # to thresholding g_i directly, avoiding an unnecessary exp() over
-        # every (env, ray) pair just to compare against a threshold.
+        # E_i = exp(2 g_i) is monotonic in g_i, so threshold g_i directly.
         log_thresholds = (math.log(1.0e-8) / 2.0, math.log(1.0e-10) / 2.0, math.log(1.0e-12) / 2.0)
         self._diag_count_e_1e8 += torch.count_nonzero(g < log_thresholds[0])
         self._diag_count_e_1e10 += torch.count_nonzero(g < log_thresholds[1])
@@ -752,12 +708,8 @@ class LaserSacTrainer:
         self._diag_sum_omega += safety.cbf_value_nominal.sum()
         self._diag_sum_correction_norm += safety.correction_norm.sum()
         self._diag_sum_active += safety.active.float().sum()
-        # Cheap per-ray "terminal dominant" proxy: is this ray's terminal
-        # branch (min of its own h_B_geom, h_B_rec) tighter than this
-        # state's own best current-time HOCBF ray? Deliberately O(R), no
-        # sort -- the exhaustive top-3/top-5 LSE-weight ranking used for the
-        # offline influence diagnostic (test_bcbf_terminal_invariance.py) is
-        # too expensive to run every control step.
+        # O(R) "terminal dominant" proxy: is a ray's terminal branch
+        # (min of h_B_geom, h_B_rec) tighter than the best current-time ray?
         state_best_psi = psi.min(dim=1, keepdim=True).values
         terminal_dominant = torch.minimum(g, h_rec) < state_best_psi
         self._diag_sum_terminal_dominant_frac += terminal_dominant.float().mean(dim=1).sum()
@@ -772,29 +724,22 @@ class LaserSacTrainer:
         if safety.projection_feasible is not None:
             self._diag_count_fallback += torch.count_nonzero(~safety.projection_feasible)
 
-        # Initial feasibility: h_aug(z0) at states whose observation THIS
-        # step is a fresh post-reset observation (just_reset_mask is the
-        # previous step's `done`, since a standard auto-reset vec-env
-        # presents the reset observation on the very next step -- see
-        # train()'s tracking of self._prev_done for the exact assumption).
+        # Initial feasibility at fresh post-reset observations (just_reset_mask
+        # is the previous step's `done`).
         if just_reset_mask is not None and torch.any(just_reset_mask):
             h_aug_reset = safety.h_lse[just_reset_mask]
             self._diag_sum_h_aug_reset += h_aug_reset.sum()
             self._diag_count_h_aug_reset_negative += torch.count_nonzero(h_aug_reset < 0.0)
             self._diag_reset_count += torch.count_nonzero(just_reset_mask)
 
-        # Post-filter consistency: does the optional hard_clip_output step
-        # actually change the filtered command, and by how much.
+        # How much the optional hard clip changes the filtered command.
         if safety.command_preclip is not None:
             clip_diff_norm = torch.linalg.norm(safety.command - safety.command_preclip, dim=1)
             self._diag_sum_clip_norm += clip_diff_norm.sum()
             self._diag_count_clip_changed += torch.count_nonzero(clip_diff_norm > 1.0e-9)
 
-        # Joint box+half-space projection diagnostics (Tasks 3/5): empty
-        # box/half-space intersections, and the CBF residual at (a) the
-        # projected surrogate before the ZOH/hard-clip mapping and (b) the
-        # diagnostic-only surrogate that exactly reproduces the ACTUALLY
-        # EXECUTED command. Verification only -- never fed back into filter().
+        # Empty box/half-space intersections and the CBF residual at the
+        # projected and the executed command (verification only).
         if safety.joint_projection_infeasible is not None:
             self._diag_count_joint_infeasible += torch.count_nonzero(safety.joint_projection_infeasible)
         if safety.projected_cbf_residual is not None:
@@ -811,10 +756,7 @@ class LaserSacTrainer:
         self._diag_env_steps += individual_h.shape[0]
 
     def _flush_bcbf_diag(self, global_step: int) -> None:
-        """Single sync point: pulls every accumulator to the CPU once and
-        writes interval-aggregated scalars, then resets for the next
-        interval. Called at the same log_interval cadence as every other
-        TensorBoard write in this loop."""
+        """Pull the accumulators to the CPU once, log interval scalars, and reset."""
         if self._diag_env_steps == 0:
             return
         n = float(self._diag_env_steps)
@@ -914,19 +856,8 @@ class LaserSacTrainer:
         if self.vector_step >= vector_steps:
             raise ValueError(f"Checkpoint vector_step={self.vector_step} is already at or beyond target={vector_steps}")
         hp = self.cfg.sac
-        # learning_starts is calibrated at reference_dt to represent a fixed
-        # number of *episode-equivalents* of warm-up data (episode length in
-        # steps is episode_duration_s/high_level_dt, so a smaller dt means
-        # more steps -- and more raw transitions -- per episode). Left
-        # unscaled, a faster high_level_dt would start training on a buffer
-        # holding far fewer complete episode trajectories than the archived
-        # setup did (e.g. only ~1/5 as many at 5x the decision rate), giving
-        # the critic a much less representative sample of how episodes
-        # actually end right when learning begins -- the same category of
-        # issue replay_size has, just for the warm-up threshold instead of
-        # total capacity. Scaling by 1/dt_scale (the inverse of the reward/
-        # gamma/tau correction) restores the same episode-equivalent warm-up
-        # coverage at any high_level_dt; a no-op at the archived default.
+        # learning_starts counts warm-up transitions at reference_dt; scale it so
+        # the warm-up covers the same number of episodes at any high_level_dt.
         dt_scale = float(self.cfg.navigation.high_level_dt) / float(hp.reference_dt)
         effective_learning_starts = int(round(hp.learning_starts / dt_scale))
         if self.target_vector_steps is None:
@@ -943,13 +874,8 @@ class LaserSacTrainer:
         # after restoring sampler state so its first maps match absolute progress.
         obs_dict = self.env.reset() if self.resumed else self.env.get_observations()
         obs = self.actor_obs(obs_dict).to(self.device)
-        # Tracks which envs' CURRENT obs is a fresh post-reset observation,
-        # for the bCBF diagnostics' initial-feasibility check (h_aug(z0)>=0).
-        # True for every env at loop start (both the resumed .reset() and the
-        # fresh .get_observations() path start from an initial/reset state);
-        # updated to this iteration's `done` after each step_safe call, since
-        # a standard auto-reset vec-env presents the reset observation on the
-        # very next step.
+        # Marks envs whose current observation follows a reset (all at start),
+        # for the initial-feasibility diagnostic.
         self._prev_done = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.device)
         start_time = time.perf_counter()
         bank = self._map_bank_metadata() or {}
@@ -979,8 +905,8 @@ class LaserSacTrainer:
                     nominal_cmd = self.actor.normalized_to_command(nominal_normalized)
                 else:
                     out = self.actor.sample(obs)
-                    nominal_cmd, safe_norm, safe_cmd, safety = (
-                        out.nominal_command, out.safe_normalized, out.safe_command, out.safety
+                    nominal_cmd, nominal_normalized, safe_norm, safe_cmd, safety = (
+                        out.nominal_command, out.nominal_normalized, out.safe_normalized, out.safe_command, out.safety
                     )
                 if self._bcbf_diag_enabled:
                     self._accumulate_bcbf_diag(safety, just_reset_mask=self._prev_done)
@@ -1001,7 +927,14 @@ class LaserSacTrainer:
             terminal_mask = done.detach()
             if time_outs is not None:
                 terminal_mask = terminal_mask & ~time_outs.to(done.device).bool()
-            self.buffer.add_batch(obs, safe_norm.detach(), reward.detach(), replay_next_obs, terminal_mask.detach())
+            self.buffer.add_batch(
+                obs,
+                safe_norm.detach(),
+                reward.detach(),
+                replay_next_obs,
+                terminal_mask.detach(),
+                nominal_action=nominal_normalized.detach() if self.critic_sees_nominal_action else None,
+            )
             obs = next_obs
             self.vector_step = absolute_step
             self.global_step += self.env.num_envs
