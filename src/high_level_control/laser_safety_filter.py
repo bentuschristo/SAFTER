@@ -96,9 +96,8 @@ class LaserScanCbfClosedForm:
 
 
 class LaserZeroBackupLseCbfClosedForm:
-    """Deployment laser version of the v4 closed-form zero-backup bCBF-CD.
+    """NumPy closed-form zero-backup bCBF with control dynamics, for deployment.
 
-    This is the NumPy counterpart of ``src.high_level_rl.laser_cbf_filters``.
     It uses the current LiDAR scan as the barrier reference and keeps an
     internal actual-command state u.  The terminal term is directional:
 

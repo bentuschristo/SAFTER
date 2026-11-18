@@ -3,20 +3,18 @@ scripts/plot_seaspeed_combined_trajectories.py's trajectory loader
 (load_laser_trajectory reads columns "case_id", "post_x_m", "post_y_m",
 "outcome" from a CSV, filtered by case_id).
 
-Use this to add a CBF-RL line to that figure for the exact same (start,
-goal) case already selected for the SAC methods there -- run
-`python scripts/plot_seaspeed_combined_trajectories.py` first, it prints
-the selected start/goal per map, e.g.:
+Adds a CBF-RL line to that figure for the same (start, goal) case shown for
+the SAC methods. The plot script prints the selected start/goal per map, e.g.:
 
   slalom: SAC seed=1001 case_id=16 start=(-2.14, 5.03) goal=(-3.19, -5.67)
 
-then pull start_yaw from that case's own
-`<sac_run_root>/seed_<seed>/<map>/<method>/<method>_episodes.csv` (column
-start_yaw) and pass all five values here.
+start_yaw comes from that case's
+`<sac_run_root>/seed_<seed>/<map>/<method>/<method>_episodes.csv`; pass all
+five values here.
 
 Example:
   python scripts/log_cbf_rl_trajectory.py Unitree-Go2-Safe-Navigation \\
-      --checkpoint logs/rsl_rl/go2_cbf_rl/2026-09-14_16-51-50_dual_handcrafted2_seed0/model_1666.pt \\
+      --checkpoint logs/rsl_rl/go2_cbf_rl/<run>/model_<iter>.pt \\
       --low-level-checkpoint logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt \\
       --map-name slalom \\
       --start-x -2.1429476737976074 --start-y 5.030910015106201 --start-yaw -1.722939590507896 \\

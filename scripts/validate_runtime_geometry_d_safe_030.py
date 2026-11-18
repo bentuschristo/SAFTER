@@ -1,17 +1,13 @@
-"""Pre-training validation of the v6 invariant-ellipse bCBF-CF using the
-EXACT runtime safety geometry the planned smoke/sweep training command
-would actually construct (--safety-clearance 0.30), not raw LaserSafetyConfig
-defaults.
+"""Validate the invariant-ellipse bCBF-CF under the runtime safety geometry
+that training constructs with --safety-clearance 0.30 (not raw
+LaserSafetyConfig defaults).
 
-Reuses every test function from test_bcbf_terminal_invariance.py UNCHANGED
-(no terminal formulation, terminal scale, controller, or SAC logic is
-touched here) -- this script only changes WHICH filter instances those
-functions are called with, by resolving the runtime geometry first via
-_runtime_safety_config.resolve_runtime_safety_config (the same formula the
-training script itself uses).
+Runs the test functions from test_bcbf_terminal_invariance.py on filters built
+from _runtime_safety_config.resolve_runtime_safety_config, the same geometry
+resolution the training script uses.
 
 Run:
-    python scripts_august/scripts_v6/validate_runtime_geometry_d_safe_030.py
+    python scripts/validate_runtime_geometry_d_safe_030.py
 """
 from __future__ import annotations
 

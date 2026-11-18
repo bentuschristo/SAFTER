@@ -5,19 +5,12 @@ from typing import Any
 
 import torch
 
-# NOTE: CbfRlNavigationEnv genuinely subclasses LaserSacNavigationEnv (reuses
-# its LiDAR wiring/procedural-map reset machinery) and reuses several of its
-# config dataclasses, so unlike the smaller shared config/math files handled
-# elsewhere in this reorg (which got duplicated into SAFTER_src), these are a
-# real cross-package dependency on SAFTER_src -- duplicating an 85KB,
-# actively-changing environment class would just guarantee silent drift.
+# CbfRlNavigationEnv subclasses LaserSacNavigationEnv (LiDAR wiring, procedural
+# map resets) from SAFTER_src, falling back to src/ when SAFTER_src is absent.
 try:
-    # Local repo state: high_level_laser_sac lives under SAFTER_src/.
     from SAFTER_src.high_level_laser_sac.config import LaserRewardConfig
     from SAFTER_src.high_level_laser_sac.sac_navigation_env import LaserSacNavigationEnv
 except ModuleNotFoundError:
-    # Server state: SAFTER_src/ hasn't been synced there -- fall back to the
-    # original location.
     from src.high_level_laser_sac.config import LaserRewardConfig
     from src.high_level_laser_sac.sac_navigation_env import LaserSacNavigationEnv
 from src.high_level_rl.laser_cbf_filters import LaserScanCbfClosedForm
@@ -58,10 +51,8 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             low_policy,
             command_interface,
             cfg.navigation,
-            # Unused by this env's step() -- kept only to satisfy
-            # LaserSacNavigationEnv's constructor, which stores it as
-            # self.sac_reward_cfg. This env's own reward math lives in
-            # step() below and reads cfg.reward (CbfRlRewardConfig) instead.
+            # Required by the parent constructor but unused: step() reads
+            # cfg.reward (CbfRlRewardConfig).
             reward_cfg=LaserRewardConfig(),
             laser_cfg=cfg.laser,
             safety_cfg=cfg.safety,
@@ -92,18 +83,13 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         self.mode_cfg = cfg.mode
         self.cbf_reward_cfg = cfg.reward
         if self._any_square_slot and safety.collision_geometry != "circle":
-            # Matches step_safe()'s own restriction exactly: box-vs-ellipse
-            # Minkowski overlap isn't implemented, so a square slot requires
-            # the "circle" collision_geometry branch below.
+            # Box-vs-ellipse Minkowski overlap is not implemented (as in step_safe()).
             raise ValueError(
                 "Any square obstacle slot currently requires safety.collision_geometry='circle'"
             )
 
-        # Asymmetric-vx affine action map (action_low/action_high/center/
-        # half_range), replicated from LaserSafeSacActor (networks.py) since
-        # this env's plain PPO actor has no equivalent built-in action head.
-        # min_vx is otherwise unused by HighLevelNavigationEnv's own
-        # _scale_action/step(), which are symmetric-+-max_vx only.
+        # Asymmetric-vx affine action map [-1, 1] -> [low, high], as in
+        # LaserSafeSacActor; the plain PPO actor has no such action head.
         action_low = torch.tensor(
             (action_cfg.min_vx, -action_cfg.max_vy, -action_cfg.max_wz), device=self.device
         )
@@ -115,14 +101,9 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         self._action_center = (action_low + action_high) / 2.0
         self._action_half_range = (action_high - action_low) / 2.0
 
-        # 100-completed-episode rolling outcome rates, matching
-        # LaserSacTrainer's rolling_100 mechanism and TensorBoard tag names
-        # (Train/episode_{success,collision,timeout}_rate_100) exactly, so
-        # this overlays as the same chart as the SAC baselines. Unlike
-        # rsl_rl's own generic extras["log"] averaging (a per-iteration mean
-        # of a per-step indicator diluted across every env at every step,
-        # not per-episode), these deques are extended only with the outcome
-        # of envs whose episode just ended.
+        # Rolling outcome rates over the last 100 completed episodes, with the
+        # same TensorBoard tags as LaserSacTrainer so curves are comparable.
+        # Only envs whose episode just ended contribute.
         self._episode_outcome_rolling: dict[str, deque[float]] = {
             name: deque(maxlen=100) for name in ("success", "collision", "timeout", "fall")
         }
@@ -136,16 +117,12 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         nav_cfg = self.navigation_cfg
         nominal = self._scale_action(action)
 
-        # Always compute the filter, regardless of ablation mode -- the
-        # demo repo computes both the filtered action and the CBF
-        # diagnostics unconditionally, gating only whether they're used.
+        # The filter always runs; the ablation mode only gates whether its
+        # command and diagnostics are used.
         safety = self.cbf_filter.filter(self.laser_ranges(), self.ray_angles, nominal)
         safe = safety.command if self.mode_cfg.use_cbf_action_filtering else nominal
 
-        # The filter's own hard_clip_output uses a symmetric +-max_vx box (see
-        # LaserScanCbfClosedForm docstring precedent: narrowing the proposal/
-        # output range after the filter is a subset of what it already
-        # handles). Re-clamp to the actual asymmetric [min_vx, max_vx] range.
+        # The filter clips to a symmetric +-max_vx box; re-clamp to [min_vx, max_vx].
         safe = torch.clamp(safe, self._action_low, self._action_high)
         previous_safe = self.previous_safe_command.clone()
         previous_distance = self.previous_goal_distance.clone()
@@ -161,13 +138,9 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         distance = torch.linalg.norm(self.goal_positions - p, dim=-1)
         progress = previous_distance - distance
 
-        # Same collision geometry used by the laser SAC pipeline's
-        # step_safe(), so "same elliptical CBF, same margin" extends to how a
-        # physical collision is defined too. Two branches, exactly mirroring
-        # step_safe: "ellipse" (Minkowski overlap of the oriented robot
-        # footprint against each obstacle, circular slots only) and "circle"
-        # (simple center-distance overlap, with a square-obstacle sub-case
-        # needed for maps like circle_and_square).
+        # Collision geometry as in the laser SAC step_safe(): "ellipse"
+        # (Minkowski overlap of the oriented footprint, circular slots only) or
+        # "circle" (center-distance overlap, with a square-obstacle case).
         geometry = self.laser_safety_cfg
         rel_w = self.obstacle_centers - p[:, None, :]
         d_obs = torch.linalg.norm(rel_w, dim=-1)
@@ -275,10 +248,8 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         smoothness = torch.sum((safe - previous_safe).pow(2), dim=-1)
         log = {
             "reward_progress": progress.mean(),
-            # Per-step (not per-episode) indicator means, diluted across
-            # every env at every step -- kept for a low-latency live signal,
-            # but NOT comparable to the SAC trainer's rolling-100 stats
-            # below.
+            # Per-step indicator means (live signal); not comparable to the
+            # per-episode rolling-100 rates below.
             "success_rate": goal.float().mean(),
             "collision_rate": collision.float().mean(),
             "fall_rate": fallen.float().mean(),
@@ -316,12 +287,8 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             "observations": self._compute_observation(),
             "time_outs": truncated,
             "log": log,
-            # Per-env outcome flags (this step, not aggregated), for
-            # evaluation scripts scoring individual episodes -- matching the
-            # SAC pipeline's step_safe()/extras naming convention
-            # (completed_success/collision/timeouts/fallen/outside) so an
-            # eval script can read extras["completed_X"][env_id] wherever
-            # done[env_id] is True.
+            # Per-env outcome flags for this step (same names as the SAC
+            # step_safe() extras); valid where done[env_id] is True.
             "completed_success": goal,
             "completed_collision": collision,
             "completed_timeouts": truncated,
@@ -329,11 +296,8 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             "completed_outside": outside,
             "completed_env_ids": ids,
             "distance_to_goal": distance.detach().clone(),
-            # Absolute (x, y) position after this step's substeps, captured
-            # before any just-terminated env is reset below -- so on a
-            # terminal step this is still the true termination position, not
-            # a post-reset one. Lets an external script log a clean per-step
-            # trajectory without duplicating step()'s internals.
+            # World (x, y) after this step, captured before resets, so terminal
+            # steps report the termination position.
             "position": p.detach().clone(),
         }
 

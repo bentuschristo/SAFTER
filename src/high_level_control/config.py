@@ -28,14 +28,11 @@ class ControllerConfig:
 
 @dataclass
 class KeyboardConfig:
-    # Command applied to an axis while its key is held down (video-game
-    # style), not an incremental step.
+    # Command applied to an axis while its key is held (not an increment).
     vx_speed: float = 0.8
     vy_speed: float = 0.5
     wz_speed: float = 0.8
-    # A key counts as "still held" as long as the terminal's OS key-repeat
-    # stream keeps delivering it faster than this; once repeats stop for
-    # longer than this, the axis snaps to zero.
+    # The axis snaps to zero once key-repeat bytes stop for longer than this.
     release_timeout: float = 0.35
 
 

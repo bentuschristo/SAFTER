@@ -1,46 +1,28 @@
 #!/usr/bin/env python3
-"""Evaluate the heuristic (P-controller) nominal policy against a SAC-based
-nominal policy, both passed through the same safety filter, on EITHER a bank
-of procedural scenario maps (--map-source procedural, the handcrafted2-style
-training maps) OR the structured unseen low/medium/high-shift maps
-(--map-source structured) -- any filter, any map source, any nominal policy,
-in one script.
+"""Evaluate a heuristic or SAC nominal policy through a chosen safety filter.
 
---nominal-source {heuristic, sac} selects the nominal policy:
-    heuristic: BatchedGoToGoalController, an obstacle-blind P controller.
-               Stateless: its output IS the instantaneously-applied body
-               velocity, clipped to HEURISTIC_MIN_CMD/MAX_CMD. This is the
-               only heuristic mode supported, on every map source, so
-               results are comparable across them. No stateful
-               (acceleration-integrator) variant is provided: its uncapped
-               velocity state would make the nominal commands depend on
-               the script rather than on the safety filter under test.
-    sac:       the raw nominal command from a trained (no-filter) SAC
-               checkpoint passed via --vanilla-checkpoint. Supported on
-               both map sources; on --map-source structured the laser is
-               evaluated with noise enabled to match the checkpoint's own
-               training-time laser config (load_actor compares it for
-               exact equality), while the heuristic source keeps noise
-               off on both map sources for a deterministic evaluation.
---filter-type selects the safety filter, built via
-    eval_vanilla_filterswap.py's build_retrofit_filter() so every nominal
-    source/map source sees an identical filter construction. Any filter
-    type that function supports works here, on either map source.
+Runs on the procedural training-map bank (--map-source procedural) or on the
+structured low/medium/high-shift maps (--map-source structured).
+
+--nominal-source {heuristic, sac}:
+    heuristic: BatchedGoToGoalController, an obstacle-blind, stateless P
+               controller whose output is the applied body velocity, clipped
+               to HEURISTIC_MIN_CMD/MAX_CMD. LiDAR noise is off.
+    sac:       the raw (pre-filter) command of the SAC checkpoint given by
+               --vanilla-checkpoint. LiDAR noise is on, matching the
+               checkpoint's training configuration (load_actor checks it).
+--filter-type: any filter supported by eval_vanilla_filterswap.py's
+    build_retrofit_filter(), so every nominal and map source uses identical
+    filter construction.
 --map-source {procedural, structured} (default procedural):
-    procedural: --procedural-map-bank / --map-id select the scenario map
-        bank and optionally restrict evaluation to a single map within it.
-    structured: --maps selects which of the low/medium/high-shift maps to
-        evaluate (one env per map, same as the project's reference
-        structured-map evaluator); --min-endpoint-clearance/--block-margin/
-        --blocked-t-min/--blocked-t-max/--max-sampling-attempts/
-        --yaw-jitter-rad control structured scenario sampling, matching
-        evaluate_laser_unseen_maps_structured.py's own defaults.
+    procedural: --procedural-map-bank selects the bank, --map-id one map.
+    structured: --maps selects the maps; the scenario-sampling flags
+        (--min-endpoint-clearance, --block-margin, --blocked-t-min,
+        --blocked-t-max, --max-sampling-attempts, --yaw-jitter-rad) default to
+        the values of evaluate_laser_unseen_maps_structured.py.
 
-Logs per-step clip-vs-barrier-certificate diagnostics (clip_delta,
-clip_changed, residual_exec, projection_feasible) and reports both
-per-episode and pooled (step-weighted) rates: clip_triggered_rate,
-barrier_violated_given_clip_rate, barrier_violated_given_no_clip_rate,
-barrier_violated_given_clip_feasible_rate, and clip_delta_norm_max.
+Per-step clip and barrier diagnostics (clip_delta, clip_changed, residual_exec,
+projection_feasible) are reported per episode and pooled over steps.
 """
 from __future__ import annotations
 
@@ -120,50 +102,24 @@ AVAILABLE_STRUCTURED_MAPS = tuple(
     name for name in UNSEEN_MAPS if name in STRUCTURED_SCENARIO_REGIONS
 )
 
-# ControllerConfig defaults, src/high_level_control/config.py. kp_x/kp_y/
-# kp_yaw are the P-gains; min/max_v* are the heuristic's OWN output clip,
-# independent of (and well inside) the safety filter's own action box. The
-# P-law output IS the instantaneously-applied body velocity every step (no
-# inertia) -- the only heuristic mode this script supports, on every map
-# source.
+# P-gains and the heuristic's own output clip (ControllerConfig defaults),
+# which lies inside the safety filter's action box.
 HEURISTIC_KP = (0.8, 0.8, 1.5)
 HEURISTIC_MIN_CMD = (-0.8, -0.7, -1.0)
 HEURISTIC_MAX_CMD = (1.2, 0.7, 1.0)
 
 
 class BatchedGoToGoalController:
-    """Batched torch port of
-    src/high_level_control/controller.py:FeedbackLinearizationController.compute
-    composed with src/high_level_control/trajectories.py:PointGoal and
-    src/high_level_control/model.py:HighLevelKinematicModel.input_matrix,
-    operating on [B, ...] pose/goal tensors instead of a single numpy pose.
+    """Batched obstacle-blind go-to-goal P controller.
 
-    HighLevelKinematicModel's input_matrix(theta) with the default
-    controlled_point_x == controlled_point_y == 0.0 (ModelConfig's own
-    defaults -- the robot base origin is the controlled point) is
+    With the controlled point at the base origin, the kinematic input matrix
+    is a planar rotation, so the body command is
 
-        B(theta) = [[cos(theta), -sin(theta), 0],
-                    [sin(theta),  cos(theta), 0],
-                    [0,           0,          1]]
+        command_xy = R(theta)^T @ (K_xy @ position_error)
+        command_wz = k_yaw * yaw_error
 
-    i.e. a pure planar rotation on the (vx, vy) block plus the identity on
-    wz. Being a rotation matrix, its inverse is its transpose in closed
-    form -- no per-sample linear solve is needed:
-
-        command_xy = R(theta)^T @ desired_pose_rate_xy
-        command_wz = desired_pose_rate_wz
-
-    PointGoal.evaluate() always returns velocity=[0, 0, 0], so
-    desired_pose_rate = K @ error exactly (no feedforward term).
-
-    This heuristic has no obstacle awareness and no prescribed final
-    heading (the structured-scenario manifests only define a goal (x, y),
-    the same way the SAC policy's own observation only encodes a relative
-    goal POSITION, never a target yaw). The reference yaw fed to the P
-    controller's yaw channel is therefore the current bearing from the
-    robot to the goal (atan2(dy, dx)), recomputed every step: a standard
-    "turn-to-face-then-drive" pursuit heading, not a hard-coded orientation
-    target.
+    clipped to HEURISTIC_MIN_CMD/MAX_CMD. The goal has no target heading; the reference yaw is the current bearing
+    to the goal, atan2(dy, dx), recomputed every step.
     """
 
     def __init__(self, device: torch.device | str, dtype: torch.dtype = torch.float32) -> None:
@@ -213,9 +169,7 @@ def evaluate(
 
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
-    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters
-    # -- see evaluate_laser_unseen_maps_structured.evaluate_method_vectorized
-    # for the full rationale.
+    # Step-weighted (pooled) clip and barrier counters.
     pooled_diag_steps = 0
     pooled_clip_steps = 0
     pooled_clip_violation_steps = 0
@@ -305,12 +259,9 @@ def evaluate(
                     ranges = actor._ranges(actor_obs)
                     angles = actor.ray_angles.to(device=actor_obs.device, dtype=actor_obs.dtype)
 
-                # Every filter built by build_retrofit_filter() accepts this same
-                # signature; filters without control dynamics simply ignore the
-                # command-state argument. bcbf_cd_lse_adapted is the one filter
-                # whose command-state argument is the robot's measured body
-                # velocity rather than the previously executed command -- see
-                # LaserZeroBackupCdLseAdapted's docstring.
+                # The adapted filter's control-dynamics state is the measured
+                # body velocity; the other filters use the previously executed
+                # command (filters without control dynamics ignore it).
                 command_state = (
                     measured_velocity if filter_type == "bcbf_cd_lse_adapted" else current_command
                 )
@@ -654,10 +605,8 @@ def run_structured_map(
         map_name=map_name,
         laser_num_rays=args.laser_num_rays,
         laser_fov_deg=args.laser_fov_deg,
-        # Matches build_procedural_environment's convention: a SAC checkpoint's
-        # saved laser config is compared for full equality on load, so noise
-        # must stay on to match training. Heuristic eval has no checkpoint to
-        # match and keeps noise off for a deterministic evaluation.
+        # A SAC checkpoint's laser config (noise on) must match exactly on
+        # load; the heuristic source runs without noise.
         enable_lidar_noise=(args.nominal_source == "sac"),
         hard_clip_output=True,
         collision_geometry=args.collision_geometry,
@@ -801,9 +750,7 @@ def main() -> None:
             action_max_wz=ACTION_LIMITS[2],
             backup_margin=args.backup_margin,
             low_checkpoint=args.low_level_checkpoint,
-            # Matches build_structured_environment's convention: a SAC checkpoint's
-            # saved laser config has noise enabled, so only the sac nominal source
-            # needs it; the heuristic nominal source stays deterministic.
+            # Same LiDAR-noise rule as the structured map source.
             enable_lidar_noise=(args.nominal_source == "sac"),
         )
         try:

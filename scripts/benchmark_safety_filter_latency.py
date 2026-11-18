@@ -1,31 +1,23 @@
 #!/usr/bin/env python3
 """Latency microbenchmark: SAFTER (bcbf_cf, closed-form) vs bCBF-QP
 (bcbf_lse_cd_qp_cfmatched, LSE-aggregated single-row QP) vs Composite-QP
-(bcbf_nonlse_cd_qp, fully unaggregated ~2700-row QP -- every current HOCBF,
-backup-horizon, and terminal ray term kept as its own individual affine
-constraint, per LaserZeroBackupNonLseControlDynamicsQp's docstring).
+(bcbf_nonlse_cd_qp, unaggregated ~2700-row QP: every current HOCBF,
+backup-horizon, and terminal ray term is its own affine constraint).
 
-All three filters are constructed with IDENTICAL geometry/backup/LSE
-hyperparameters -- the exact LaserSafetyConfig defaults this project trains
-and evaluates with (SAFTER_src/high_level_laser_sac/config.py), with
-backup_margin=0.6 and qp_backend="osqp" matching every eval command run
-this session -- so the only thing that differs between the three timed
-objects is the projection/solve algorithm itself.
+All filters share the same geometry/backup/LSE hyperparameters (the
+LaserSafetyConfig defaults, with backup_margin=0.6 and qp_backend="osqp" as
+in evaluation), so only the projection/solve algorithm differs.
 
 Reports two numbers per filter per batch size:
   - "total": the full filter.filter(...) call (constraint construction +
     projection/solve).
   - "projection-only": just the solve step -- self.projector.project(...)
-    for both QP variants, the module-level _exact_projection(...) call for
-    the closed form (the legacy_projection=True path, matching every
-    eval command's --legacy-projection flag).
-Both are measured with a warmup phase, explicit torch.cuda.synchronize()
-around each timed region (GPU ops are async -- unsynchronized wall-clock
-timing is meaningless), and reported as mean/median/p95/p99 in milliseconds
-over many repeated calls.
+    for the QP variants, _exact_projection(...) for the closed form
+    (the legacy_projection=True path used in evaluation).
+Both use a warmup phase and torch.cuda.synchronize() around each timed
+region (GPU ops are async), reported as mean/median/p95/p99 in milliseconds.
 
-Pure tensor-op benchmark -- no MuJoCo/environment/checkpoint needed, so this
-runs entirely locally regardless of server GPU availability.
+Pure tensor-op benchmark -- no MuJoCo/environment/checkpoint needed.
 
 Usage:
     python -u scripts/benchmark_safety_filter_latency.py --batch-sizes 1 500
@@ -52,9 +44,7 @@ NUM_RAYS = 120
 FOV_DEG = 360.0
 MAX_RANGE = 5.0
 
-# LaserSafetyConfig defaults (SAFTER_src/high_level_laser_sac/config.py),
-# with backup_margin/qp_backend overridden to match every eval command run
-# this session (--backup-margin 0.6 --qp-backend osqp).
+# LaserSafetyConfig defaults, with --backup-margin 0.6 --qp-backend osqp as in evaluation.
 SHARED_KWARGS = dict(
     d_safe=0.30,
     max_vx=2.0, max_vy=1.0, max_wz=1.0,
@@ -95,20 +85,12 @@ QP_KWARGS = dict(
     straight_through=True,
     qp_backend="osqp",
 )
-# LaserZeroBackupLseControlDynamicsQpCfMatched ("bCBF-QP" above) ignores its
-# own qp_backend/straight_through/max_active_candidates constructor args and
-# always solves via QpthProjector internally (see class docstring/__init__,
-# laser_cbf_filters.py:2089-2105) -- so for an apples-to-apples solver
-# comparison, Composite-QP needs its own qpth-backed build too.
+# bCBF-QP always solves with QpthProjector regardless of qp_backend, so
+# Composite-QP also gets a qpth-backed build for a same-solver comparison.
 QP_KWARGS_QPTH = dict(QP_KWARGS, qp_backend="qpth")
 
-# LaserZeroBackupLseQp ("bCBF-LSE-QP, no control dynamics") has no first-order
-# command-state surrogate, so none of BACKUP_KWARGS' control_dynamics_a/
-# tracking_sigma/integration_dt/terminal_backup_mode/hocbf_k0/kappa_input/
-# kappa_outer/barrier_rate_scale apply -- it only takes the geometry +
-# box-limit kwargs from SHARED_KWARGS, its own alpha (reusing BACKUP_KWARGS'
-# alpha_outer value for an apples-to-apples strengthening gain), and its own
-# backup_margin/backup_samples/kappa_backup (same values as BACKUP_KWARGS).
+# LaserZeroBackupLseQp (no control dynamics) takes only the geometry/box-limit
+# kwargs, alpha (= alpha_outer), and backup_margin/backup_samples/kappa_backup.
 NOCD_KWARGS = dict(
     d_safe=SHARED_KWARGS["d_safe"],
     robot_length_m=SHARED_KWARGS["robot_length_m"],
@@ -132,12 +114,9 @@ NOCD_KWARGS = dict(
 )
 
 
-# Pure per-step control-input synthesis: no backup rollout/terminal set at
-# all (not even the no-CD filter's trivial repeated-row backup), no
-# control-dynamics surrogate. Only the direct relative-degree-one ray
-# barrier(s) at the CURRENT instant feed the QP. Same geometry/box-limit/
-# alpha/qp-backend values as NOCD_KWARGS, minus the backup_* fields, which
-# these classes don't accept.
+# Direct per-step synthesis: only the current relative-degree-one ray
+# barriers feed the QP (no backup rollout, no control-dynamics surrogate).
+# Same values as NOCD_KWARGS minus the backup_* fields.
 DIRECT_KWARGS = {
     k: v for k, v in NOCD_KWARGS.items()
     if k not in ("backup_margin", "backup_samples", "kappa_backup")

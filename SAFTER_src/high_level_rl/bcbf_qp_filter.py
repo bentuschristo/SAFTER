@@ -1,10 +1,3 @@
-# NOTE: this is a TRIMMED duplicate of src/high_level_rl/bcbf_qp_filter.py --
-# only QpSolveDiagnostics/SmallBoxQpProjector/OsqpProjector/QpthProjector
-# (the classes laser_cbf_filters.py actually lazy-imports) are kept. The
-# original's ZeroBackupBcbfQpFilter class is map-based-only (subclasses the
-# map-based ZeroBackupLseCbfClosedForm) and is intentionally dropped here.
-# See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -105,7 +98,6 @@ class SmallBoxQpProjector:
         weights = weights.to(device=device, dtype=dtype).clamp_min(self.regularization)
         winv = 1.0 / weights
 
-        # First check if the desired command is already feasible.
         violation = A @ desired[:, :, None]
         violation = violation.squeeze(-1) - b
         feasible_desired = violation.max(dim=1).values <= self.feasibility_tol

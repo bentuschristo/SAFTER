@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
-"""Evaluate SAC policies (vanilla/cbf_cd_cf/bcbf_cf) on the actual
-TRAINING procedural map bank (handcrafted2: 5 maps x 200 scenarios each),
-with the safety filter DISABLED at runtime.
+"""Evaluate SAC policies (vanilla, cbf_cd_cf, bcbf_cf) on the training
+procedural map bank (handcrafted2: 5 maps x 200 scenarios) with the safety
+filter disabled.
 
-"Disabled" means: the actor's `safety` object (filter diagnostics/correction)
-is still computed every step (so BcbfDiag-style stats remain available if
-ever needed), but the command that actually reaches the low-level policy is
-always the RAW/NOMINAL actor output -- `env.step_safe(nominal, nominal,
-safety)` -- never the filtered/safe command. For method="vanilla" this is a
-no-op (nominal == safe already, by construction). For cbf_cd_cf/bcbf_cf this
-answers "how much does the CBF/bCBF math itself matter" versus what the
-learned policy does on its own, in-distribution.
+The actor's filter diagnostics are still computed each step, but the command
+sent to the low-level policy is always the raw nominal action
+(env.step_safe(nominal, nominal, safety)), so this measures the learned policy
+on its own, in distribution.
 
-Scenario selection is fully deterministic: for each of the 5 training maps
-and each of 25 evaluation seeds, 20 scenario ids are sampled (without
-replacement) from that map's own 200 scenarios via a seeded RNG, giving 500
-cases/map (2500 total) -- the same 25-seed x 20-case convention used
-throughout this project's unseen-map evaluations. Each case is pinned with
-env.set_fixed_procedural_scenarios(...) (bypassing curriculum/random
-sampling and the reset-time feasibility resampler), so re-running this
-script reproduces the identical map+start+goal every time.
+Scenarios are deterministic: for each training map and each of 25 evaluation
+seeds, 20 scenario ids are sampled without replacement (500 cases per map) and
+pinned with env.set_fixed_procedural_scenarios(...).
 
-No per-step trajectory logging -- only one row per episode (ids + outcome +
-path_length_m/episode_duration_s). path_length_m is the true integrated path length
-(summed step-to-step displacement of the robot's root position, via the same
-env.safety_context() positions used by evaluate_laser_unseen_maps_structured.py's
-own path-length tracking), not a straight-line distance.
+Writes one row per episode: ids, outcome, integrated path length and duration.
 """
 from __future__ import annotations
 
@@ -57,10 +44,8 @@ from SAFTER_src.high_level_rl.low_level import load_frozen_low_level_policy
 
 
 def _load_sibling_module(name: str, relative_path: str):
-    # A regular (has __init__.py) "scripts" package from a ROS install
-    # shadows this repo's scripts/ directory on sys.path -- `import
-    # scripts.foo` would resolve to THAT package and fail. Load these
-    # sibling script files directly by path instead.
+    # Load by path: an installed "scripts" package (e.g. from ROS) can shadow
+    # this repository's script directories on sys.path.
     path = ROOT / relative_path
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -154,9 +139,8 @@ def build_environment(
         arena=None,
         laser_num_rays=laser_num_rays,
         laser_fov_deg=laser_fov_deg,
-        # Default True matches training exactly (checkpoint's saved laser dict
-        # is compared for full equality); callers evaluating a nominal source
-        # other than the trained SAC actor (e.g. a heuristic) pass False.
+        # True matches training (load_actor compares the laser config exactly);
+        # a heuristic nominal source passes False.
         enable_lidar_noise=enable_lidar_noise,
         hard_clip_output=True,
         collision_geometry=collision_geometry,
@@ -200,11 +184,8 @@ def build_environment(
         if event_name in env_cfg.events:
             del env_cfg.events[event_name]
 
-    # Match the training entry point's arena override exactly: only
-    # wall/obstacle clearance and obstacles=() are overridden; width/length/
-    # wall_thickness/wall_height/robot_radius/max_obstacles/obstacle_shape
-    # come from the bank's own arena (identical to the LaserSacConfig()
-    # defaults for handcrafted2).
+    # Same arena override as training: only the clearances and obstacles=()
+    # change; all other arena fields come from the bank.
     safety_arena_template = replace(
         bank_arena, obstacles=(), wall_clearance=float(cfg.safety.d_safe), obstacle_clearance=float(cfg.safety.d_safe)
     )
@@ -446,9 +427,7 @@ def main() -> None:
     episodes: list[dict] = []
     for method in args.methods:
         method_env_kwargs = dict(common_env_kwargs)
-        # The vanilla/cbf_cd_cf/bcbf_cf checkpoints were all trained with
-        # these terminal-set settings; load_actor's config-mismatch check
-        # enforces them for every method.
+        # Terminal-set settings used in training (load_actor checks them).
         method_env_kwargs["terminal_backup_mode"] = "invariant_ellipse"
         method_env_kwargs["legacy_projection"] = True
         evaluate_method(

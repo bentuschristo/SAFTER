@@ -14,7 +14,7 @@ class HighLevelState:
 
 
 class HighLevelKinematicModel:
-    """Planar high-level model used in the previous model-based controller.
+    """Planar high-level kinematic model.
 
     Xdot = B(theta) U,
     X = [x, y, theta], U = [vx_body, vy_body, omega].

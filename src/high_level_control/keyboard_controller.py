@@ -36,18 +36,11 @@ class TerminalKeyboardController:
       space or x: stop
       r: reset
 
-    Each axis is commanded at a fixed speed while its key is held, and
-    snaps to zero the instant the key is released -- there is no
-    increment/hold-between-presses state like a classic teleop tool.
-
-    Terminals never report key-up events, only key-down bytes, so "held"
-    is inferred from the OS's own key-repeat stream: as long as repeat
-    bytes for a key keep arriving faster than `release_timeout`, the axis
-    stays active; once they stop arriving, it zeros on the next poll tick.
-    If a hold feels like it blips to zero right after the initial press
-    (the gap before the OS's auto-repeat kicks in), raise
-    --high-level.keyboard.release-timeout to match your terminal's key
-    repeat delay.
+    Each axis is commanded at a fixed speed while its key is held and snaps
+    to zero when it is released. Terminals report only key-down bytes, so a
+    key counts as held while OS key-repeat bytes arrive faster than
+    `release_timeout`; raise --high-level.keyboard.release-timeout if a hold
+    drops to zero before the terminal's auto-repeat starts.
 
     The terminal running the script must have keyboard focus.
     """

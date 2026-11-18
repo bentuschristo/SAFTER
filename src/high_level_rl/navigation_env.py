@@ -29,7 +29,6 @@ class HighLevelNavigationEnv:
         self.low_policy = low_policy
         self.command_interface = command_interface
 
-        # High-level navigation settings.
         self.nav_cfg = cfg
 
         # Keep the underlying MJLab config here so the native viewer
@@ -429,7 +428,6 @@ class HighLevelNavigationEnv:
         safe[:, 2].clamp_(-self.nav_cfg.action.max_wz, self.nav_cfg.action.max_wz)
 
         for _ in range(self.nav_cfg.low_steps_per_high_step):
-            # self.command_interface.write_batch(safe)
             low_obs = self.low_env.get_observations()
             joint_action = self.low_policy(low_obs, safe)
             self.low_env.step(joint_action)

@@ -36,10 +36,6 @@ from src.high_level_control.state_interface import MjlabHighLevelStateInterface
 from src.high_level_control.trajectories import make_trajectory
 from src.tasks.velocity.config.go2 import obstacle_cfg as physical_arena_cfg
 from src.high_level_rl.laser_scan import LaserScanConfig, simulate_planar_laser_scan
-# NOTE: raycast_patterns.py moved to SAFTER_src (it's laser-pipeline code);
-# this keyboard-teleop demo is excluded from that move (it uses the separate
-# generic high_level_control feedback-linearization framework, not SAC), so
-# it now reaches across into SAFTER_src just for this one small utility.
 from SAFTER_src.high_level_rl.raycast_patterns import HorizontalRingPatternCfg, horizontal_ray_angles
 
 
@@ -70,9 +66,7 @@ class LaserDebugConfig:
     # Arena boundary walls. Off by default: at the ~7.5m half-size arena
     # extent, rays bouncing off the far walls clutter the LiDAR view.
     add_walls: bool = False
-    # Draw the LiDAR ray lines/hit markers in the viewer. The sensor itself
-    # (and the console readings from --laser.print-every) keep running
-    # either way; this only toggles the drawn ray arrows.
+    # Only toggles the drawn rays; the sensor and console readings keep running.
     show_rays: bool = True
     # Flat, visual-only yellow square marking a goal near the edge of the
     # currently-installed physical map.
@@ -197,10 +191,8 @@ def install_selected_physical_map(selection: str) -> None:
     print(f"[LASER] Installed physical map {selection}: {len(obstacles)} obstacles")
 
 
-# Flat, visual-only (contype=0/conaffinity=0) yellow square marking a goal
-# near the edge of the currently-installed physical map, styled like
-# scripts/capture_map_topdown.py's GOAL_COLOR overlay (translucent fill +
-# solid-color border).
+# Visual-only (contype=0/conaffinity=0) goal marker: translucent fill plus a
+# solid border.
 _GOAL_RGB = (1.000, 0.839, 0.039)
 _GOAL_FILL_ALPHA = 0.43
 _GOAL_BORDER_WIDTH = 0.08

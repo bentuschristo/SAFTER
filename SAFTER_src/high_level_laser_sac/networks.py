@@ -70,27 +70,17 @@ class LaserSafeSacActor(nn.Module):
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
         self.method = method
-        # Eval/deployment-only escape hatch: when True, apply_safety() still
-        # runs the filter (so filter_active/correction metrics keep logging
-        # normally) but executes the RAW nominal command instead of the
-        # filtered one -- lets an eval script measure a trained checkpoint's
-        # unfiltered collision rate without touching training, which always
-        # leaves this at its default False.
+        # Evaluation only: still run the filter for diagnostics but execute the
+        # raw nominal command. Training always leaves this False.
         self.disable_safety_filter = False
         self.range_start = int(range_start)
         self.num_rays = int(num_rays)
         self.max_range = float(max_range)
         self.hard_clip_output = bool(safety_cfg.hard_clip_output)
         self.register_buffer("ray_angles", ray_angles.detach().clone().float())
-        # This actor's own nominal/hard-clip command range, AND (as of the
-        # min_vx passthrough into kwargs below) the safety filter's own
-        # admissible-input box too -- the filter's formal safety proof must
-        # bound what the frozen low-level locomotion policy can actually
-        # track, not a wider/narrower box of the filter's own invention; a
-        # "safe" command the low-level policy never learned to execute is
-        # not actually safe in practice. Defaults to the archived symmetric
-        # [-action_limits[0], action_limits[0]] range on vx when min_vx is
-        # not given, so every existing caller/checkpoint is unaffected.
+        # Command range of the actor and the filter's admissible-input box, so
+        # the filter only certifies commands the low-level policy can track.
+        # vx is symmetric when min_vx is not given.
         effective_min_vx = -float(action_limits[0]) if min_vx is None else float(min_vx)
         action_low = torch.tensor(
             (effective_min_vx, -float(action_limits[1]), -float(action_limits[2])),
@@ -305,9 +295,7 @@ class LaserSafeSacActor(nn.Module):
                 **kwargs,
             )
         elif method == "bcbf_cd_lse_adapted":
-            # Control-dynamics bCBF-QP filter combining all constraints with
-            # a single flat softmin (see LaserZeroBackupCdLseAdapted
-            # docstring in laser_cbf_filters.py).
+            # Adapted control-dynamics bCBF-QP (see LaserZeroBackupCdLseAdapted).
             self.safety_filter = LaserZeroBackupCdLseAdapted(
                 backup_margin=safety_cfg.backup_margin,
                 backup_horizon_s=safety_cfg.backup_horizon_s,
@@ -358,12 +346,7 @@ class LaserSafeSacActor(nn.Module):
                 **kwargs,
             )
         elif method == "bcbf_lse_qp":
-            # No control-dynamics state at all (no control_dynamics_a/
-            # tracking_sigma/integration_dt/terminal_backup_mode/hocbf_k0/
-            # barrier_rate_scale/kappa_input/kappa_outer -- this filter
-            # doesn't have those concepts). Reuses alpha_outer/kappa_backup/
-            # backup_margin/backup_samples -- the single soft-min backup row
-            # plays the same role those play in the CD backup filters.
+            # No control-dynamics state; only the backup-row parameters apply.
             self.safety_filter = LaserZeroBackupLseQp(
                 alpha=safety_cfg.alpha_outer,
                 backup_margin=safety_cfg.backup_margin,
@@ -389,9 +372,7 @@ class LaserSafeSacActor(nn.Module):
         return torch.clamp(normalized * self.max_range, min=0.0, max=self.max_range)
 
     def normalized_to_command(self, normalized: torch.Tensor) -> torch.Tensor:
-        """Map a per-axis [-1, 1] value to this actor's own [low, high]
-        command range. Reduces to normalized * action_high (the archived
-        symmetric formula) when low == -high."""
+        """Map a per-axis [-1, 1] value to this actor's [low, high] command range."""
         return self.action_center + normalized * self.action_half_range
 
     def command_to_normalized(self, command: torch.Tensor) -> torch.Tensor:
@@ -413,10 +394,9 @@ class LaserSafeSacActor(nn.Module):
             safety = self.safety_filter.filter(ranges, angles, nominal_command)
             command = safety.command
         else:
-            # bcbf_cd_lse_adapted's command-dynamics state is the robot's
-            # measured body velocity (obs[:, 2:5]), not the previously
-            # executed command (obs[:, 5:8]) the other control-dynamics
-            # filters use -- see LaserZeroBackupCdLseAdapted's docstring.
+            # The adapted filter's state is the measured body velocity
+            # (obs[:, 2:5]); the other control-dynamics filters use the
+            # previous executed command (obs[:, 5:8]).
             command_state = obs[:, 2:5] if self.method == "bcbf_cd_lse_adapted" else obs[:, 5:8]
             safety = self.safety_filter.filter(
                 ranges,
@@ -485,15 +465,8 @@ class QNetwork(nn.Module):
 
 
 class TwinQCritic(nn.Module):
-    """extra_action_dim=0 (the default) reproduces every existing
-    checkpoint's critic exactly: Q(obs, action). A nonzero extra_action_dim
-    (critic_sees_nominal_action ablation) instead learns Q(obs, action,
-    extra_action) -- intended for extra_action = the CURRENT-step nominal
-    (pre-filter) action, alongside the usual safe/executed action, so the
-    critic can directly attribute value to "what the policy wanted" versus
-    "what the filter actually let through" instead of inferring it
-    indirectly from the one-step-stale previous_nominal_command already
-    baked into obs."""
+    """Twin Q critic Q(obs, action). A nonzero extra_action_dim
+    (critic_sees_nominal_action ablation) learns Q(obs, action, nominal_action)."""
 
     def __init__(
         self, obs_dim: int, action_dim: int, hidden_dims: tuple[int, ...], extra_action_dim: int = 0

@@ -1,15 +1,12 @@
 """Train the CBF-RL PPO high-level navigation policy.
 
 Reimplements Yang et al., "CBF-RL: Safety Filtering Reinforcement Learning
-in Training with Control Barrier Functions" (Papers_Ref/), using this
-repo's own elliptical LiDAR CBF (src.high_level_rl.laser_cbf_filters) with
-the same footprint/margin fields as the laser SAC pipeline, and rsl_rl PPO
-in place of the paper's own PPO/rsl_rl demo (lzyang2000/cbf-rl-demo).
+in Training with Control Barrier Functions", using this repo's elliptical
+LiDAR CBF (src.high_level_rl.laser_cbf_filters) with the same footprint and
+margin fields as the laser SAC pipeline, trained with rsl_rl PPO.
 
-Collision termination here is purely geometric (ellipse-vs-obstacle
-Minkowski overlap, matching the paper's own simple safety notion), not the
-laser SAC pipeline's contact-force-based termination -- so no MuJoCo
-contact sensors are needed, only the LiDAR raycast sensor.
+Collision termination is purely geometric (ellipse-vs-obstacle Minkowski
+overlap, as in the paper), so only the LiDAR raycast sensor is needed.
 
 Ablation modes (Yang et al. Table III / cbf-rl-demo's four shell scripts):
   --use-cbf-action-filtering --use-cbf-reward-penalty     : Dual (the paper's proposed method)
@@ -19,9 +16,7 @@ Ablation modes (Yang et al. Table III / cbf-rl-demo's four shell scripts):
 
 By default the environment uses the fixed 9-obstacle arena in
 HighLevelNavigationConfig.arena. Pass --procedural-map-bank to train on a
-saved procedural map bank instead (e.g. generated/procedural_maps/handcrafted2),
-mirroring scripts/train_SAC_policies.py's map-bank
-plumbing.
+saved procedural map bank instead, as in SAFTER_scripts/train_SAC_policies.py.
 """
 from __future__ import annotations
 
@@ -35,10 +30,7 @@ import mujoco
 import torch
 import tyro
 
-# SAFTER_src isn't registered by the repo's editable install (only `src` is,
-# via __editable__.unitree_rl_mjlab-*.pth) -- resolvable from a cwd-relative
-# `python -c` snippet but not from `python scripts/foo.py` (script-relative
-# sys.path[0]). Same fix already used elsewhere in this repo for ad-hoc dirs.
+# SAFTER_src is not part of the editable install, so add the repo root to sys.path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -56,8 +48,6 @@ from src.high_level_cbf_rl.cbf_rl_navigation_env import CbfRlNavigationEnv
 from src.high_level_cbf_rl.config import CbfRlConfig, CbfRlModeConfig
 from src.high_level_control.command_interface import MjlabVelocityCommandInterface
 try:
-    # Local repo state: high_level_laser_sac lives under SAFTER_src/ (moved
-    # there for the paper's supplementary code package).
     from SAFTER_src.high_level_laser_sac.procedural_maps import (
         CURRICULUM_WEIGHTS,
         ProceduralMapBank,
@@ -65,8 +55,7 @@ try:
         resolve_slot_shapes,
     )
 except ModuleNotFoundError:
-    # Server state: SAFTER_src/ hasn't been synced there -- fall back to the
-    # original location.
+    # Fallback for layouts without SAFTER_src/.
     from src.high_level_laser_sac.procedural_maps import (
         CURRICULUM_WEIGHTS,
         ProceduralMapBank,
@@ -78,13 +67,7 @@ from src.high_level_rl.raycast_patterns import HorizontalRingPatternCfg
 
 
 def make_walls_only_arena_cfg(arena) -> EntityCfg:
-    """Physical walls matching the active procedural map bank's arena size.
-
-    Copied from scripts/train_SAC_policies.py -- kept
-    duplicated (not imported, since scripts/ isn't an importable package)
-    per this repo's existing convention of each training script owning its
-    own scene-construction helpers.
-    """
+    """Physical walls matching the active procedural map bank's arena size."""
     half_x = 0.5 * float(arena.width)
     half_y = 0.5 * float(arena.length)
     half_t = 0.5 * float(arena.wall_thickness)
@@ -190,14 +173,12 @@ class TrainCbfRlConfig:
     resume_checkpoint: str | None = None
     use_cbf_action_filtering: bool = True
     use_cbf_reward_penalty: bool = True
-    # Convenience overrides matching train_SAC_policies.py's
-    # CLI, for launch-command parity with existing SAC baselines.
+    # LiDAR overrides with the same names as train_SAC_policies.py's CLI.
     laser_num_rays: int = 61
     laser_fov_deg: float = 180.0
     laser_max_range: float = 5.0
     enable_lidar_noise: bool = False
-    # None (default): fixed HighLevelNavigationConfig.arena. Set to train on
-    # a saved procedural map bank instead, e.g. generated/procedural_maps/handcrafted2.
+    # None: fixed HighLevelNavigationConfig.arena; otherwise a saved procedural map bank.
     procedural_map_bank: str | None = None
     expected_num_maps: int | None = 100
     expected_scenarios_per_map: int | None = 64
@@ -250,13 +231,8 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
         env_cfg.scene.entities["navigation_arena"] = make_walls_only_arena_cfg(bank_arena)
         for slot, entity_name in enumerate(procedural_entity_names):
             env_cfg.scene.entities[entity_name] = make_procedural_obstacle_slot_entity(slot, slot_shapes[slot])
-        # HighLevelNavigationEnv sizes its obstacle_centers/radii/mask tensors
-        # from navigation.arena.max_obstacles -- this MUST match the bank's
-        # own max_obstacles (e.g. 12 for handcrafted2), not the default fixed
-        # ArenaConfig()'s 9, or _activate_procedural_maps below fails with a
-        # tensor shape mismatch. obstacles=() since actual poses/radii come
-        # from the reusable mocap slots, not static XML, matching
-        # train_SAC_policies.py's own derivation.
+        # Obstacle tensors are sized from arena.max_obstacles, which must equal
+        # the bank's slot count; obstacle poses come from the mocap slots.
         arena_template = procedural_map_bank.maps[0].arena
         empty_arena_template = replace(arena_template, obstacles=())
         for item in procedural_map_bank.maps[1:]:
@@ -304,19 +280,15 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
     if procedural_map_bank is not None:
         env.assert_procedural_geometry_synchronized()
 
-    # Reuse the low-level task's PPO defaults as a template (network/algo
-    # sizing is inferred at runtime from the env's actual obs/action tensor
-    # shapes), then override with CBF-RL-specific hyperparameters -- same
-    # pattern as scripts/train_high_level_rl.py.
+    # Start from the low-level task's PPO defaults, then set CBF-RL hyperparameters.
     agent_cfg = load_rl_cfg(task_id)
     agent_cfg.experiment_name = cfg.experiment_name
     agent_cfg.run_name = cfg.run_name
     agent_cfg.seed = cfg.seed
     agent_cfg.max_iterations = cfg.max_iterations
     agent_cfg.save_interval = cfg.save_interval
-    # Below: cbf-rl-demo's validated PPO hyperparameters (smaller MLP than
-    # the locomotion policy's [512,256,128] since the obs space here is lean
-    # -- goal + LiDAR + previous commands, no joint state).
+    # PPO hyperparameters from the CBF-RL reference implementation; a small MLP
+    # suffices for the goal + LiDAR + previous-command observation.
     agent_cfg.num_steps_per_env = 48
     agent_cfg.actor.hidden_dims = (128, 128)
     agent_cfg.critic.hidden_dims = (128, 128)
@@ -338,8 +310,7 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
     log_dir = Path("logs/rsl_rl") / cfg.experiment_name / f"{stamp}{suffix}"
     log_dir.mkdir(parents=True, exist_ok=True)
     dump_yaml(log_dir / "params" / "navigation.yaml", asdict(method_cfg.navigation))
-    # Preserve termination geometry, sensors, rewards and ablation switches
-    # as well as navigation settings; defaults can change between runs.
+    # Save the full method config so each run is reproducible.
     dump_yaml(log_dir / "params" / "cbf_rl.yaml", asdict(method_cfg))
     dump_yaml(log_dir / "params" / "agent.yaml", asdict(agent_cfg))
     if procedural_map_bank is not None:

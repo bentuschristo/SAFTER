@@ -1,8 +1,3 @@
-# NOTE: this is a DUPLICATE of src/high_level_rl/config.py, kept in sync manually.
-# It exists here because src/high_level_rl/config.py is also load-bearing for
-# map-based code (high_level_sac/high_level_bcbf_sac/high_level_cbf_rl) that
-# intentionally stays outside SAFTER_src. See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,9 +9,7 @@ class CircularObstacle:
     y: float
     radius: float
     height: float = 1.0
-    # Per-obstacle shape, independent of ArenaConfig.obstacle_shape (which
-    # remains only a legacy/default metadata field). Defaults to "circle" so
-    # every existing caller that never sets this is unaffected.
+    # Per-obstacle shape; ArenaConfig.obstacle_shape is only a default label.
     shape: str = "circle"
 
 
@@ -86,15 +79,10 @@ class ArenaConfig:
 
 @dataclass(frozen=True)
 class HighLevelActionConfig:
-    # Matches the frozen low-level velocity-tracking policy's own trained
-    # command range (see logs/rsl_rl/go2_velocity/.../params/env.yaml's
-    # lin_vel_x curriculum, final stage (-1.0, 2.0); lin_vel_y/ang_vel_z
-    # final stage (-1.0, 1.0)): commanding a velocity outside that range
-    # asks the locomotion policy to track something it never learned to.
+    # Matches the command range the frozen low-level locomotion policy was
+    # trained to track: vx in [-1, 2], vy and wz in [-1, 1].
     max_vx: float = 2.0
-    # Lower bound for vx, independent of max_vx (asymmetric forward/reverse
-    # envelope). vy/wz remain symmetric (+-max_vy/+-max_wz); only vx has
-    # ever needed an asymmetric bound so only vx gets one here.
+    # Asymmetric forward/reverse vx envelope; vy and wz are symmetric.
     min_vx: float = -1.0
     max_vy: float = 1.0
     max_wz: float = 1.0
@@ -141,8 +129,7 @@ class BackupSafetyConfig:
     integration_dt: float = 0.10
     denominator_epsilon: float = 1.0e-8
 
-    # Keep the augmented terminal set as clearance-only, matching the uploaded
-    # BCBF_USE_AUGMENTED_TERMINAL_SET=0 variant.
+    # The augmented terminal set uses clearance terms only.
     terminal_near_stop_enabled: bool = False
     terminal_u_eps: tuple[float, float, float] = (0.08, 0.04, 0.08)
 

@@ -11,22 +11,10 @@ class SacHyperparameters:
     """Soft Actor-Critic hyperparameters for the laser-based navigation policy."""
 
     hidden_dims: tuple[int, ...] = (512, 256, 128)
-    # gamma and tau are both *per-decision* persistence/decay factors, not
-    # per-second ones -- gamma compounds once per critic-target bootstrap
-    # (one high-level step) and tau's Polyak average is applied once per
-    # gradient update (one high-level step at update_every_steps=1). At a
-    # fixed nominal value, changing navigation.high_level_dt silently changes
-    # what these factors mean in real time: e.g. gamma=0.99 compounds to an
-    # effective per-second discount of 0.99**10=0.904 at high_level_dt=0.10
-    # (10 Hz) but only 0.99**50=0.605 at high_level_dt=0.02 (50 Hz) -- the
-    # agent's effective planning horizon shrinks from ~10s to ~2s even though
-    # the reward magnitude was already correctly dt-scaled elsewhere. Both
-    # values below are calibrated at reference_dt; the trainer applies
-    # gamma_effective = gamma**(high_level_dt/reference_dt) and
-    # tau_effective = 1-(1-tau)**(high_level_dt/reference_dt) so the same
-    # *effective per-second* discounting/target-tracking rate is preserved
-    # at any high_level_dt. The ratio is 1.0 (hence no change) at the default
-    # high_level_dt == reference_dt.
+    # gamma and tau are per-step factors calibrated at reference_dt. The trainer
+    # rescales them as gamma**(dt/reference_dt) and 1-(1-tau)**(dt/reference_dt)
+    # so the per-second discount and target-tracking rate are independent of
+    # navigation.high_level_dt.
     reference_dt: float = 0.10
     gamma: float = 0.99
     tau: float = 0.005
@@ -43,13 +31,8 @@ class SacHyperparameters:
     log_std_min: float = -5.0
     log_std_max: float = 2.0
     gradient_clip_norm: float = 10.0
-    # When True, the critic additionally conditions on the CURRENT-step
-    # nominal (pre-filter) action, alongside the usual (obs, safe_action)
-    # pair -- not just the one-step-stale previous_nominal_command already
-    # baked into obs. False (default) reproduces every existing checkpoint's
-    # critic architecture exactly (obs_dim+action_dim input, unchanged). See
-    # TwinQCritic's extra_action_dim and VectorReplayBuffer's nominal_action
-    # field, both no-ops when this is False.
+    # Ablation: the critic also conditions on the current nominal (pre-filter)
+    # action in addition to (obs, safe action). False keeps the standard critic.
     critic_sees_nominal_action: bool = False
 
 
@@ -57,30 +40,20 @@ LaserSacMethod = Literal[
     "vanilla", "cbf_cf_clip", "cbf_qp", "cbf_lse_qp",
     "cbf_cd_cf", "cbf_lse_cd_qp", "bcbf_cf", "bcbf_qp", "bcbf_lse_cd_qp",
     "bcbf_nonlse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "cbf_lse_cd_qp_cfmatched",
-    # Control-dynamics bCBF-QP filter combining all constraints with a
-    # single flat softmin. See LaserZeroBackupCdLseAdapted in
-    # laser_cbf_filters.py.
+    # Adapted control-dynamics bCBF-QP (LaserZeroBackupCdLseAdapted).
     "bcbf_cd_lse_adapted",
-    # Zero-backup LSE-aggregated QP WITHOUT control dynamics: the decision
-    # variable is the directly-applied body command (no first-order command-
-    # state surrogate), backup law is exactly zero velocity (kinematic flow,
-    # no coasting), and the six input-limit rows are literal hard box
-    # constraints rather than a softened/aggregated barrier. See
-    # LaserZeroBackupLseQp in laser_cbf_filters.py.
+    # Zero-backup LSE QP without control dynamics, with hard box input
+    # constraints (LaserZeroBackupLseQp).
     "bcbf_lse_qp",
 ]
 CollisionGeometry = Literal["circle", "ellipse"]
 CollisionTerminationMode = Literal["circle", "direct_contact"]
 LidarNoisePreset = Literal["clean", "nominal", "moderate", "severe"]
-# "legacy_inflated_ellipse": original velocity-inflated terminal ellipse
-#   (delta_b(T) = backup_margin + sqrt(vx^2+vy^2+eps^2)-eps folded directly
-#   into the semi-axes). Not generally forward-invariant under the
-#   zero-surrogate backup (see laser_cbf_filters.py terminal_h_and_grad_future
-#   docstring) -- retained for comparison.
-# "invariant_ellipse": fixed-geometry terminal ellipse (R_x=r_x+backup_margin,
-#   R_y=r_y+backup_margin, no velocity folded into the axes) intersected with
-#   a separate residual-motion recoverability condition. See
-#   terminal_invariant_h_and_grad_future.
+# "legacy_inflated_ellipse": velocity-inflated terminal ellipse; not generally
+#   forward-invariant under the zero backup (see terminal_h_and_grad_future).
+# "invariant_ellipse": fixed-geometry terminal ellipse (axes + backup_margin)
+#   intersected with a residual-motion recoverability condition (see
+#   terminal_invariant_h_and_grad_future).
 TerminalBackupMode = Literal["legacy_inflated_ellipse", "invariant_ellipse"]
 QpBackend = Literal["active_set", "qpth", "osqp"]
 RewardProfile = Literal["original", "seanav_comparable"]
@@ -111,15 +84,8 @@ class LaserObservationConfig:
     sensor_name: str = "navigation_laser"
     lidar_site_name: str = "lidar_site"
     debug_vis: bool = False
-    # How often (in seconds) the LiDAR is actually re-sampled, independent of
-    # how often the high-level policy is queried (navigation.high_level_dt).
-    # Defaults to the 10 Hz high-level cadence, so with high_level_dt=0.10 the
-    # refresh interval is 1 step (a fresh reading every high-level
-    # step). Set navigation.high_level_dt faster (e.g. 0.02, matching
-    # low_level_dt) while leaving this at 0.10 to decouple decision rate from
-    # sensor rate: the policy is queried every step, but reuses the same
-    # cached scan across the intervening steps until this period elapses,
-    # modeling a LiDAR that physically only spins/refreshes at its own rate.
+    # LiDAR refresh period [s], independent of navigation.high_level_dt. With a
+    # faster policy rate, the cached scan is reused until this period elapses.
     update_dt: float = 0.10
 
 
@@ -129,24 +95,11 @@ class LaserRewardConfig:
     # changes only the analogous goal, collision/unsafe-termination, and
     # timeout terms; all other shaping terms below are shared by both profiles.
     profile: RewardProfile = "original"
-    # The high_level_dt every weight below (except progress_weight and the
-    # one-time episode-outcome bonuses/penalties) was tuned at. Per-step shaping terms
-    # (time, forward_alignment, reverse_motion, yaw_tracking, smoothness,
-    # cbf_correction) are auto-scaled by navigation.high_level_dt /
-    # reference_dt at reward-computation time (see step_safe), so their
-    # *per-second* contribution stays approximately constant however often
-    # the policy is actually queried -- e.g. running at high_level_dt=0.02
-    # (5x more steps/sec than this reference) automatically divides each of
-    # those weights by 5, rather than silently applying them 5x more often
-    # per second as raw unscaled per-step constants would. progress_weight is
-    # deliberately excluded: progress is a physical per-step distance delta
-    # that already shrinks proportionally with a smaller dt on its own, so
-    # scaling it again would double-count. The one-time episode-outcome terms
-    # (goal_bonus, timeout_penalty, collision_penalty) are also excluded --
-    # they fire once per episode outcome, not once per second, so they don't
-    # have the "accumulates faster at a smaller dt" problem in the first
-    # place. At the default high_level_dt == reference_dt, the scale factor
-    # is exactly 1.0 and every weight below applies as written.
+    # Per-step shaping weights (time, forward_alignment, reverse_motion,
+    # yaw_tracking, smoothness, cbf_correction) are scaled by
+    # high_level_dt / reference_dt so their per-second effect is rate
+    # independent. Progress (already a per-step distance) and one-time outcome
+    # terms are not scaled.
     reference_dt: float = 0.10
     progress_weight: float = 4.0
     goal_bonus: float = 30.0
@@ -167,13 +120,8 @@ class LaserRewardConfig:
     seanav_collision_scale: float = -4.0
     seanav_collision_velocity_scale: float = 4.0
     seanav_termination_scale: float = -100.0
-    # SEA-Nav's own reward has no timeout term; it relies on a "stuck" term
-    # (scale=-5.0: dead-end/no-progress penalty) that discourages a policy from
-    # loitering near the goal to dodge collision risk instead of committing to
-    # the final approach. That "stuck" term is not part of this reward, so the
-    # timeout scale is set to SEA-Nav's "stuck" scale as the closest analog
-    # (both terms penalize failing to make progress), which keeps pressure
-    # against stalling.
+    # SEA-Nav has no timeout term; its no-progress ("stuck") scale is used as
+    # the closest analog.
     seanav_timeout_scale: float = -5.0
 
 
@@ -217,8 +165,8 @@ class LaserSafetyConfig:
     # propagates the robot pose relative to those points; no global map is used.
     geometry_model: str = "local_scan_point_v2"
 
-    # Backward-compatible front-ray threshold measured from the LiDAR origin.
-    # The LiDAR extrinsic matches the lidar_site in the Go2 MJCF exactly.
+    # Front-ray threshold measured from the LiDAR origin. The LiDAR extrinsic
+    # matches the lidar_site in the Go2 MJCF.
     d_safe: float = 0.30
     robot_length_m: float = 0.70
     robot_width_m: float = 0.31
@@ -258,9 +206,6 @@ class LaserSafetyConfig:
     backup_samples: int = 21
     backup_rollout_substeps: int = 8
 
-    # Terminal-set construction. invariant_ellipse (two-condition
-    # forward-invariant terminal set: h_B_geom + h_B_rec) is the default;
-    # "legacy_inflated_ellipse" is available for comparison.
     terminal_backup_mode: TerminalBackupMode = "invariant_ellipse"
     # Positive normalization scales applied to the two dimensionless
     # invariant-ellipse terminal constituents before they enter the
@@ -268,25 +213,15 @@ class LaserSafetyConfig:
     terminal_geom_scale: float = 1.0
     terminal_rec_scale: float = 1.0
 
-    # Selects which projection step bcbf_cf's filter uses, independent of
-    # terminal_backup_mode above. True (default) projects onto the CBF
-    # half-space alone (_exact_projection, no box baked in) and relies on a
-    # post-hoc clamp -- the same projection cbf_cd_cf's filter uses. False
-    # uses the joint box+half-space projection (zoh_surrogate_bounds
-    # + _exact_box_halfspace_projection), which bounds the achievable
-    # surrogate command given the ZOH decay BEFORE projecting, so a
-    # subsequent hard clip cannot invalidate the CBF guarantee.
+    # bcbf_cf projection: True projects onto the CBF half-space alone followed
+    # by a clamp; False uses the joint box + half-space projection, so the
+    # hard clip cannot invalidate the CBF condition.
     legacy_projection: bool = True
 
     control_dynamics_a: tuple[float, float, float] = (8.0, 8.0, 8.0)
-    # bcbf_cf-only "sidestep-then-stop" backup controller generalization.
-    # Nonzero entries make the backup policy transiently coast toward this
-    # commanded velocity before its own intent decays away (rate
-    # backup_intent_decay_rate) and the trajectory settles back to rest, same
-    # as the original zero-backup policy -- so the terminal set(s) above stay
-    # valid unchanged. (0, 0, 0) (the default) reproduces the original
-    # zero-backup flow bit-for-bit. See LaserZeroBackupLseCbfClosedForm /
-    # exact_decaying_target_backup_state_and_phi.
+    # bcbf_cf only: "sidestep-then-stop" backup target whose intent decays at
+    # backup_intent_decay_rate, so the backup still comes to rest and the
+    # terminal sets remain valid. (0, 0, 0) gives the zero-backup flow.
     backup_target_command: tuple[float, float, float] = (0.0, 0.0, 0.0)
     backup_intent_decay_rate: float = 2.0
     tracking_sigma: tuple[float, float, float] = (8.0, 8.0, 8.0)
@@ -304,14 +239,9 @@ class LaserSafetyConfig:
     qp_regularization: float = 1.0e-5
     qp_straight_through: bool = True
     qp_backend: QpBackend = "active_set"
-    # bcbf_cf-only ablation switch: LaserZeroBackupLseCbfClosedForm is natively
-    # closed-form differentiable (the true CBF-projection Jacobian flows into
-    # the policy), so this defaults to False -- every existing/default bcbf_cf
-    # checkpoint keeps training under the true gradient. Setting True swaps in
-    # the same straight-through trick qp_straight_through already uses for the
-    # QP filters (output = desired + (output - desired).detach()), isolating
-    # whether the CF filter's differentiability itself (vs. just executing
-    # safe actions + the correction reward) is what drives bcbf_cf's benefit.
+    # bcbf_cf ablation: replace the closed-form projection Jacobian with a
+    # straight-through gradient (as used by the QP filters). False keeps the
+    # true closed-form gradient.
     cf_straight_through: bool = False
 
 
@@ -333,6 +263,6 @@ class LaserSacConfig:
 
     @property
     def actor_observation_dim(self) -> int:
-        # goal_b(2), measured command(3), previous safe command(3),
-        # laser ranges, previous nominal command(3), nominal-history valid(1)
+        # goal (2), measured body velocity (3), previous executed command (3),
+        # laser ranges, previous nominal command (3), nominal-history valid (1)
         return 12 + self.laser.num_rays

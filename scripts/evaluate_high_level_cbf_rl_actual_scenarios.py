@@ -1,19 +1,13 @@
-"""Evaluate a CBF-RL PPO checkpoint on the LITERAL 200 curated
-ProceduralScenario start/goal pairs per handcrafted2 map (not freshly
-resampled region-box cases), for filter ON and OFF, aggregated per map and
-pooled.
+"""Evaluate a CBF-RL PPO checkpoint on the 200 curated ProceduralScenario
+start/goal pairs of each handcrafted2 map (1000 cases), with the filter on
+and off, aggregated per map and pooled.
 
-This isolates whether the low pooled success rate seen in
-evaluate_high_level_cbf_rl_training_maps.py (~37%) is explained by
-eval-case-difficulty mismatch versus the actual bank scenarios the policy
-was trained on, by scoring the checkpoint on those exact 1000 scenarios
-(200/map x 5 maps) via env.set_fixed_scenarios(...) -- the same mechanism
-evaluate_high_level_cbf_rl_unseen_maps.py uses for its fixed obstacle
-layouts.
+Cases are pinned with env.set_fixed_scenarios(...), as in
+evaluate_high_level_cbf_rl_unseen_maps.py.
 
 Example:
   python scripts/evaluate_high_level_cbf_rl_actual_scenarios.py \\
-      --checkpoint logs/rsl_rl/go2_cbf_rl/2026-09-17_11-54-21_dual_handcrafted2_seed0_4096envs_1000iters/model_999.pt \\
+      --checkpoint logs/rsl_rl/go2_cbf_rl/<run>/model_999.pt \\
       --low-level-checkpoint logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt \\
       --device cuda:0
 """
@@ -120,12 +114,8 @@ def run(cfg: Config) -> None:
                 expected_scenarios_per_map=cfg.expected_scenarios_per_map,
                 expected_max_obstacles=cfg.expected_max_obstacles,
                 num_envs=cfg.num_envs,
-                # build_training_map_env sizes env_cfg.scene.num_envs as
-                # min(num_envs, cases_per_seed) -- pin cases_per_seed to
-                # num_envs so the env's actual env count matches the batch
-                # size evaluate_map() computes from our 200-scenario manifest
-                # (min(num_envs, len(manifest))), not the unrelated
-                # 20-per-seed convention this field name implies elsewhere.
+                # build_training_map_env uses min(num_envs, cases_per_seed)
+                # envs; set cases_per_seed = num_envs to match evaluate_map()'s batch size.
                 cases_per_seed=cfg.num_envs,
                 episode_duration_s=cfg.episode_duration_s,
                 seed=cfg.seed + map_index,

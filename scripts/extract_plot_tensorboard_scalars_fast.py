@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fast TensorBoard scalar extractor/plotter without TensorFlow dependency.
 
-This version uses TensorBoard's own tensor_util.make_ndarray, so it works in
-environments that have tensorboard installed but do not have tensorflow.
+Uses TensorBoard's own tensor_util.make_ndarray, so it works with tensorboard
+installed but without tensorflow.
 
 Examples
 --------
@@ -65,11 +65,10 @@ def event_files(logdir: Path) -> list[Path]:
 
 
 def scalar_from_value(value) -> float | None:
-    # Old scalar summaries.
     if value.HasField("simple_value"):
         return float(value.simple_value)
 
-    # New tensor summaries. This does NOT require tensorflow.
+    # Tensor-format summaries; decoded without tensorflow.
     if value.HasField("tensor"):
         try:
             arr = tensor_util.make_ndarray(value.tensor)

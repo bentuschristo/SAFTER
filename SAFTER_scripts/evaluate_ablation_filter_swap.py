@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """Filter-swap ablation on the three structured evaluation maps (Easy=slalom,
 Medium=corridor, Hard=circle_and_square), 25 seeds x 20 cases/seed = 500
-cases/map, matching the corrected [-1, 2] vx-bound checkpoint generation:
+cases/map:
 
-  - vanilla:   FILTER DEPLOYED. The vanilla-trained policy's nominal command
-               is passed through its own actor's `counterfactual_filter`
-               (the plain, non-backup direct-laser LSE-CBF-CF -- the same
-               filter object every actor builds for diagnostics regardless
-               of method) at DEPLOYMENT time, retrofitting a safety filter
-               onto a policy that never trained with one.
-  - cbf_cd_cf: FILTER INACTIVE. The physically-applied command is the raw
-               nominal actor output, bypassing the trained CBF-CF filter
-               entirely (same swap as evaluate_training_maps_no_filter.py).
-  - bcbf_cf:   FILTER INACTIVE, same as cbf_cd_cf.
+  - vanilla:   filter deployed. The vanilla policy's nominal command passes
+               through its actor's `counterfactual_filter` (the plain
+               direct-laser LSE-CBF-CF), retrofitting a safety filter onto
+               a policy trained without one.
+  - cbf_cd_cf: filter inactive. The raw nominal actor output is applied
+               (same swap as evaluate_training_maps_no_filter.py).
+  - bcbf_cf:   filter inactive, same as cbf_cd_cf.
 
-Reuses the existing scenario manifests from the prior vxm1 3-map eval runs
-(scenario sampling is method-independent -- generated once with
-method="vanilla" regardless of which method is later evaluated -- so those
-CSVs are the exact same cases already used for the filter-on numbers this
-ablates against). No trajectory logging -- ids + outcome only.
+Reuses the existing scenario manifests (scenario sampling is
+method-independent), so the cases are identical to the filter-on runs.
+Logs case ids and outcomes only.
 """
 from __future__ import annotations
 
@@ -49,17 +44,9 @@ _eval_module = _load_sibling_module(
     "SAFTER_scripts/laser_unseen_eval/evaluate_laser_unseen_maps_structured.py",
 )
 
-# 2026-11 maps restructure: the structured evaluator's UNSEEN_MAPS/
-# STRUCTURED_SCENARIO_REGIONS now only carry the 3 current evaluation maps
-# ("low_shift"/"medium_shift"/"high_shift", formerly "slalom"/"corridor"/
-# "corridor_derived_highshift_v5"). This ablation script still keys its
-# on-disk scenario manifests (see load_manifest below) by the OLD names
-# ("slalom", "corridor", "circle_and_square") from the prior vxm1 3-map eval
-# runs, so those old map keys are restored here -- "slalom"/"corridor" as
-# aliases of the (byte-identical, just renamed) "low_shift"/"medium_shift"
-# data, and "circle_and_square" (which has no equivalent among the new 3
-# maps -- it was never renamed, just retired) from legacy_unseen_maps.py --
-# so build_environment(map_name=...) still resolves exactly as it always did.
+# Manifests are keyed "slalom"/"corridor"/"circle_and_square": the first two
+# alias the "low_shift"/"medium_shift" maps, the third comes from
+# legacy_unseen_maps.py, so build_environment(map_name=...) resolves all three.
 from SAFTER_scripts.laser_unseen_eval.legacy_unseen_maps import (  # noqa: E402
     LEGACY_STRUCTURED_SCENARIO_REGIONS,
     LEGACY_UNSEEN_MAPS,
@@ -92,11 +79,10 @@ ABLATION_MODE = {"vanilla": "filter_deployed", "cbf_cd_cf": "filter_inactive", "
 
 
 def build_retrofit_filter(filter_type: str, cfg, action_limits: tuple[float, float, float]):
-    """Construct a filter object matching exactly what LaserSafeSacActor.__init__
-    builds for method=filter_type -- these filters have no learned/trained
-    parameters (pure analytic CBF math), so they can be applied to ANY
-    policy's nominal command, not only the one that was actually trained
-    with that filter attached."""
+    """Build the filter LaserSafeSacActor.__init__ builds for method=filter_type.
+
+    The filters have no learned parameters, so they apply to any policy's
+    nominal command."""
     safety_cfg = cfg.safety
     kwargs = dict(
         d_safe=safety_cfg.d_safe,

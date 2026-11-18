@@ -1,8 +1,3 @@
-# NOTE: this is a DUPLICATE of src/high_level_rl/laser_cbf_filters.py, kept in sync manually.
-# It exists here because src/high_level_rl/laser_cbf_filters.py is also load-bearing for
-# map-based code (high_level_sac/high_level_bcbf_sac/high_level_cbf_rl) that
-# intentionally stays outside SAFTER_src. See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,17 +12,12 @@ def _asymmetric_limits(
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Per-axis (lower, upper) admissible-command bounds for a safety filter.
 
-    vy/wz stay symmetric (+-max_vy/+-max_wz); vx alone can have an
-    independent lower bound (min_vx), matching
-    SAFTER_src/high_level_laser_sac/networks.py's actor-side asymmetric
-    action range. The filter's own admissible input set must match what the
-    frozen low-level locomotion policy was actually trained to track
-    (e.g. vx in [-1.0, 2.0], not a wider or narrower box of the filter's
-    own invention) -- commanding a "safe" velocity the low-level policy
-    never learned to track is not actually safe in practice, regardless of
-    what the high-level CBF proof says. min_vx=None reproduces the
-    original symmetric [-max_vx, max_vx] box exactly, so every existing
-    caller that never passes min_vx is unaffected.
+    vy/wz are symmetric (+-max_vy, +-max_wz); vx may have a separate lower
+    bound (min_vx), matching the actor's action range in networks.py. The
+    admissible set must match what the frozen low-level locomotion policy was
+    trained to track (e.g. vx in [-1.0, 2.0]): a command outside that range is
+    not safe in practice even if the CBF condition holds. min_vx=None gives the
+    symmetric box [-max_vx, max_vx].
     """
     effective_min_vx = -float(max_vx) if min_vx is None else float(min_vx)
     lower = (effective_min_vx, -float(max_vy), -float(max_wz))
@@ -53,32 +43,18 @@ class LaserSafetyFilterResult:
     input_bound_active: torch.Tensor | None = None
     projection_feasible: torch.Tensor | None = None
     projected_cbf_residual: torch.Tensor | None = None
-    # D_aug = ||Lg_hat h_aug||^2 (the closed-form projection's denominator).
-    # Populated only by LaserZeroBackupLseCbfClosedForm.filter() -- purely
-    # additive/diagnostic, does not affect `command` or any other field.
+    # Diagnostic fields below never affect `command`.
+    # D_aug = ||Lg_hat h_aug||^2, the closed-form projection's denominator.
     lg_aug_sq_norm: torch.Tensor | None = None
-    # Pre-hard-clip command (decay*current + (1-decay)*surrogate, before the
-    # optional torch.clamp to the action limits). Populated only by
-    # LaserZeroBackupLseCbfClosedForm.filter() -- diagnostic only, so
-    # ||command - command_preclip|| can be checked without changing what
-    # `command` itself is.
+    # Command before the final clamp to the action limits.
     command_preclip: torch.Tensor | None = None
-    # --- ZOH-consistent joint box+half-space projection diagnostics (2026-09
-    # hard-clip-consistency fix). All populated only by
-    # LaserZeroBackupLseCbfClosedForm.filter(); purely additive/diagnostic. ---
-    # True where the ZOH box and the half-space had an EMPTY intersection, so
-    # the residual-maximizing box corner (u_maxsafe) was returned instead of a
-    # true joint-feasible point. Expected to be all-False in a healthy run.
+    # True where the ZOH box and the CBF half-space do not intersect, so the
+    # residual-maximizing box corner was returned instead.
     joint_projection_infeasible: torch.Tensor | None = None
-    # ||command - command_preclip||: how much the final hard clip (Task 4's
-    # failsafe, kept per spec) still had to move the command. Should be ~0
-    # once the box constraint is already enforced inside the projection.
+    # ||command - command_preclip||; ~0 when the box is enforced in the projection.
     clip_delta: torch.Tensor | None = None
     clip_changed: torch.Tensor | None = None
-    # Diagnostic-only recovery of the surrogate command that would exactly
-    # reproduce the ACTUALLY EXECUTED (post-clip) command through the ZOH
-    # update, and the CBF residual evaluated at that surrogate. Verification
-    # only -- never used to alter the filter's own decision.
+    # CBF residual evaluated at the executed (post-clip) command.
     residual_exec: torch.Tensor | None = None
 
 
@@ -177,8 +153,7 @@ def zoh_surrogate_bounds(
     a: torch.Tensor,
     dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact ZOH-consistent surrogate bounds (2026-09-07 hard-clip-consistency
-    fix task 1).
+    """Exact ZOH-consistent surrogate bounds.
 
     Physical first-order command dynamics u_dot = -A u + A u_hat, held
     constant over one high-level interval dt, give in closed form
@@ -188,15 +163,14 @@ def zoh_surrogate_bounds(
         u_hat_lower = (u_min - Lambda u) / (1 - Lambda)
         u_hat_upper = (u_max - Lambda u) / (1 - Lambda).
     These are NOT the physical [u_min, u_max] bounds themselves -- do not
-    conflate the two (that was the original bug: hard-clipping u_next to
-    [u_min, u_max] after the fact is not equivalent to bounding u_hat this
-    way, which is why the composite CBF residual could go negative).
+    conflate the two: hard-clipping u_next to [u_min, u_max] after the fact is
+    not equivalent to bounding u_hat this way, and can make the composite CBF
+    residual go negative.
 
     ``1 - Lambda`` is computed as ``-expm1(-a*dt)`` rather than ``1 -
     exp(-a*dt)`` for numerical stability (avoids catastrophic cancellation
     when a*dt is small); for the current parameters (a=8, dt=0.1) Lambda ~=
-    0.449329, 1-Lambda ~= 0.550671, matching the closed-form values quoted
-    in the task notes.
+    0.449329, 1-Lambda ~= 0.550671.
 
     Args:
         current_command: ``(B,3)`` u_t (the augmented state's velocity part).
@@ -221,11 +195,8 @@ _BOX_HALFSPACE_ACTIVE_SET_STATES = tuple(
     (i, j, k) for i in range(3) for j in range(3) for k in range(3)
 )  # 3^3=27: each of the 3 dims is 0=free, 1=lower-active, 2=upper-active.
 
-# Precomputed once (a fixed constant, independent of any call's B/device/
-# dtype) and cached per (device, dtype) the first time each is seen, so the
-# hot filter() path never repeats 27 small host->device tensor constructions
-# per control step -- keeps this on the same "no unnecessary per-step
-# overhead" footing as the rest of this filter.
+# Cached per (device, dtype) so filter() does not rebuild the 27 active-set
+# states on every control step.
 _BOX_HALFSPACE_STATE_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
@@ -253,8 +224,7 @@ def _exact_box_halfspace_projection(
         {u : drift_plus_alpha_h + lg @ u >= 0}  INTERSECT  {u : lower<=u<=upper}
 
     (one affine half-space and a 3-D axis-aligned box), by finite active-set
-    enumeration -- NOT an iterative/generic QP solver (2026-09-07 joint
-    box+half-space projection fix, task 2).
+    enumeration -- NOT an iterative/generic QP solver.
 
     Algorithm (m=3, so at most 3^3=27 candidates plus the box-only point):
       1. Box-project `desired`; if it already satisfies the half-space,
@@ -358,13 +328,9 @@ def _exact_box_halfspace_projection(
         best_lam = torch.where(improves, lam_candidate, best_lam)
         best_obj = torch.where(improves, obj, best_obj)
 
-    # Task 3: box+half-space intersection is empty for these samples. Fall
-    # back to the box point maximizing the affine residual -- do NOT hide
-    # this with denominator/epsilon regularization. Computed unconditionally
-    # (no `if torch.any(...)` host-device sync) so this stays a pure batched
-    # GPU op with no per-control-step CPU<->GPU synchronization, matching the
-    # no-per-step-sync discipline used everywhere else in this filter/the
-    # training loop's diagnostic accumulators.
+    # Empty box/half-space intersection: return the box point maximizing the
+    # affine residual (no epsilon regularization). Computed unconditionally to
+    # avoid a host-device sync.
     joint_infeasible = ~torch.isfinite(best_obj)
     u_maxsafe = torch.where(lg >= 0.0, upper, lower)
     best = torch.where(joint_infeasible[:, None], u_maxsafe, best)
@@ -413,8 +379,8 @@ class _LocalScanPointGeometry:
         half_length = 0.5 * self.robot_length_m
         half_width = 0.5 * self.robot_width_m
         if footprint_clearance_m is None:
-            # Backward-compatible interpretation of d_safe: desired threshold
-            # along the front ray measured from the LiDAR origin.
+            # d_safe is the desired threshold along the front ray, measured
+            # from the LiDAR origin.
             front_body_distance = max(half_length - self.lidar_x_m, self.eps)
             clearance = max(0.0, self.d_safe - front_body_distance)
         else:
@@ -615,16 +581,14 @@ class _LocalScanPointGeometry:
         c_theta: float,
         a_decay_min: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward-invariant terminal backup-set pair (v6).
+        """Forward-invariant terminal backup-set pair.
 
         Replaces the single velocity-inflated terminal ellipse
         ``terminal_h_and_grad_future`` with a FIXED enlarged ellipse
         (semi-axes ``big_r_x = r_x + backup_margin``,
         ``big_r_y = r_y + backup_margin``, no residual-velocity inflation)
         intersected with a separate residual-motion recoverability
-        condition. See LaserSafetyConfig ``terminal_backup_mode=
-        "invariant_ellipse"`` and the derivation this implements
-        (2026-09-07 terminal-invariance fix).
+        condition (``terminal_backup_mode="invariant_ellipse"``).
 
         Geometric branch (dimensionless elliptical log-clearance):
             E_i   = y_x^2/big_r_x^2 + y_y^2/big_r_y^2
@@ -640,19 +604,15 @@ class _LocalScanPointGeometry:
         -- the two-function representation above encodes
         ``g_i >= sqrt(2Q)/a_decay_min`` without ever evaluating a
         nondifferentiable square root at Q=0). ``log(E_i)`` is evaluated
-        with no numerical floor: E_i can only vanish if a LiDAR point
-        coincides exactly with the terminal robot center, which the
-        diagnostic suite checks for and reports rather than silently
-        guarding against.
+        with no numerical floor: E_i vanishes only if a LiDAR point coincides
+        with the terminal robot center.
 
         Args:
             points: ``(B,R,2)`` LiDAR points in the scan-fixed frame.
             z: ``(B,6)`` terminal augmented state ``[p_x,p_y,theta,v_x,v_y,omega]``.
-            big_r_x, big_r_y: fixed terminal semi-axes (config-level
-                constants, precomputed once by the caller -- not
-                recomputed per call).
-            c_theta: ``0.5*|big_r_x/big_r_y - big_r_y/big_r_x|`` (also a
-                config-level constant, precomputed once by the caller).
+            big_r_x, big_r_y: fixed terminal semi-axes (precomputed by the caller).
+            c_theta: ``0.5*|big_r_x/big_r_y - big_r_y/big_r_x|`` (precomputed
+                by the caller).
             a_decay_min: ``min(a_x,a_y,a_omega)`` scalar tensor.
 
         Returns:
@@ -688,8 +648,7 @@ class _LocalScanPointGeometry:
         grad_g[..., 0] = -(c * eta_x - s * eta_y)
         grad_g[..., 1] = -(s * eta_x + c * eta_y)
         grad_g[..., 2] = eta_x * yy - eta_y * yx
-        # grad_g[..., 3:6] stay 0: g_i has no explicit velocity/yaw-rate
-        # dependence (unlike the legacy velocity-inflated h_terminal).
+        # grad_g[..., 3:6] stay 0: g_i has no explicit velocity/yaw-rate dependence.
 
         h_geom = g
 
@@ -932,7 +891,7 @@ class LaserScanCbfQp(_LocalScanPointGeometry):
 class LaserScanCbfLseQp(LaserScanCbfQp):
     """Direct LiDAR CBF-QP with one LSE ray row and six box rows.
 
-    This is the seven-constraint comparison requested for the direct-command
+    This is the seven-constraint formulation for the direct-command
     model.  Only the 120 geometric ray barriers are soft-min aggregated; the
     physical command bounds remain six explicit inequalities.
     """
@@ -996,7 +955,7 @@ class LaserScanCbfControlDynamicsClosedForm(_LocalScanPointGeometry):
     scan points are fixed in a temporary local frame.  The primitive geometric
     barrier has relative degree two wrt uhat; psi_i=hdot_i+k0 h_i is used and
     differentiated with respect to the complete augmented state.  This includes
-    the previously omitted k0*hdot_i contribution.
+    the k0*hdot_i contribution.
     """
 
     def __init__(
@@ -1157,11 +1116,8 @@ class LaserScanCbfControlDynamicsClosedForm(_LocalScanPointGeometry):
         correction = surrogate - desired_surrogate
         violation = torch.relu(torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)).max(dim=1).values
 
-        # Diagnostic only (see LaserZeroBackupLseCbfClosedForm.filter() for the
-        # original derivation): recover the surrogate that would exactly
-        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
-        # same ZOH update, and the CBF residual at that surrogate -- answers
-        # whether the final hard clip can reintroduce a barrier violation.
+        # Diagnostic: CBF residual at the surrogate that reproduces the executed
+        # (post-clip) command through the ZOH update.
         one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
         u_hat_exec = (command - decay * current_command) / one_minus_decay
         residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
@@ -1347,16 +1303,15 @@ class LaserScanCbfLseControlDynamicsQp(LaserScanCbfControlDynamicsClosedForm):
 
 
 class LaserScanCbfLseControlDynamicsQpCfMatched(LaserScanCbfControlDynamicsClosedForm):
-    """CF-matched differentiable-QP baseline for the laser (non-backup)
-    CBF-CD filter -- the cbf_cd_cf / cbf_lse_cd_qp counterpart of
-    LaserZeroBackupLseControlDynamicsQpCfMatched (see that class's
-    docstring for the full rationale). Builds the IDENTICAL single-row
-    ray+input LSE aggregate LaserScanCbfControlDynamicsClosedForm.filter()
-    solves in closed form (same kappa_ray, kappa_input, kappa_outer,
-    alpha_outer), always solves it with QpthProjector (exact differentiable
-    QP/KKT, no straight-through/.detach()), and explicitly reproduces the
-    closed form's active-but-degenerate zero-surrogate fallback, which
-    LaserScanCbfLseControlDynamicsQp (the existing QP variant) does not.
+    """CF-matched differentiable-QP counterpart of the cbf_cd_cf filter.
+
+    Builds the same single-row ray+input LSE aggregate that
+    LaserScanCbfControlDynamicsClosedForm.filter() solves in closed form (same
+    kappa_ray, kappa_input, kappa_outer, alpha_outer), solves it with
+    QpthProjector (exact differentiable QP/KKT, no straight-through), and
+    reproduces the closed form's zero-surrogate fallback for active-but-
+    degenerate rows. LaserZeroBackupLseControlDynamicsQpCfMatched is the
+    backup-filter analogue.
     """
 
     def __init__(
@@ -1471,9 +1426,8 @@ class LaserScanCbfLseControlDynamicsQpCfMatched(LaserScanCbfControlDynamicsClose
         correction = surrogate - desired_surrogate
         feasible = diag.max_violation <= self.projector.feasibility_tol
 
-        # Diagnostic only: CBF residual at the surrogate that would exactly
-        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
-        # same ZOH update (see LaserZeroBackupLseCbfClosedForm.filter()).
+        # Diagnostic: CBF residual at the surrogate that reproduces the executed
+        # (post-clip) command through the ZOH update.
         one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
         u_hat_exec = (command - decay * current_command) / one_minus_decay
         residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
@@ -1505,7 +1459,7 @@ class LaserScanCbfLseControlDynamicsQpCfMatched(LaserScanCbfControlDynamicsClose
 class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
     """Local-point zero-backup bCBF-LSE-CF with command dynamics.
 
-    This is the LiDAR analogue of the map-based ``bcbf_cf_zero_v4`` model:
+    LiDAR analogue of the map-based zero-backup bCBF filter:
       * q_i are current LiDAR endpoints in a temporary scan-fixed frame;
       * z=[p_x,p_y,theta,v_x,v_y,w];
       * uhat_B=0 and u_B decays under first-order command dynamics;
@@ -1588,21 +1542,12 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         self.alpha_outer = float(alpha_outer)
         self.limits_lower, self.limits_upper = _asymmetric_limits(max_vx, max_vy, max_wz, min_vx)
         self.a_tuple = tuple(float(x) for x in control_dynamics_a)
-        # Backup-controller intent: a "sidestep-then-stop" generalization of
-        # the historical "coast to a dead stop" backup policy. The augmented
-        # surrogate obeys u_dot = -A (u - u_target(t)) with a backup intent
-        # u_target(t) = backup_target_command * exp(-backup_intent_decay_rate
-        # * t) that itself fades to zero -- so the backup trajectory still
-        # converges to rest (same equilibrium as the original zero backup),
-        # it just takes a detour through a transient sidestep/creep/turn on
-        # the way there. Because the terminal state is still (to within
-        # exp(-decay_rate * backup_horizon_s), exponentially negligible for
-        # the default decay_rate=2.0/horizon=4s) at rest, BOTH existing
-        # terminal sets (legacy_inflated_ellipse, invariant_ellipse) remain
-        # valid unchanged -- this only changes the shape of the backup
-        # trajectory, not the backup set. backup_target_command=(0, 0, 0)
-        # (the default) reproduces the original zero-backup flow bit-for-bit,
-        # regardless of backup_intent_decay_rate.
+        # Backup policy: u_dot = -A (u - u_target(t)) with a decaying intent
+        # u_target(t) = backup_target_command * exp(-backup_intent_decay_rate t),
+        # i.e. an optional transient sidestep before coming to rest. The
+        # terminal state is still at rest up to exp(-decay_rate * horizon), so
+        # both terminal sets remain valid. backup_target_command=(0, 0, 0) is
+        # the zero ("coast to a stop") backup.
         self.backup_target_tuple = tuple(float(x) for x in backup_target_command)
         if len(self.backup_target_tuple) != 3:
             raise ValueError("backup_target_command must have exactly 3 entries (vx, vy, wz)")
@@ -1628,19 +1573,12 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         self.sigma_tuple = tuple(float(x) for x in tracking_sigma)
         self.dt = float(integration_dt)
         self.hard_clip_output = bool(hard_clip_output)
-        # legacy_projection=True reverts ONLY the projection/hard-clip-
-        # consistency step to the pre-2026-09-07 behavior (the same
-        # single-half-space _exact_projection + naive post-hoc clamp that
-        # cbf_cd_cf's filter still uses today, and that v4 -- which trained
-        # every checkpoint before that date -- used for bcbf_cf too): no
-        # joint box+half-space bound on the achievable surrogate given the
-        # ZOH decay. This is independent of terminal_backup_mode (one vs
-        # two terminal sets), which governs a different piece of the same
-        # filter. Kept separate so the two can be isolated one at a time.
+        # legacy_projection=True: single-half-space _exact_projection followed
+        # by a clamp (as in cbf_cd_cf), instead of the joint box+half-space
+        # projection under the ZOH decay. Independent of terminal_backup_mode.
         self.legacy_projection = bool(legacy_projection)
 
-        # --- v6 invariant-ellipse terminal set (config-level constants,
-        # computed once here rather than per filter() call). ---
+        # Invariant-ellipse terminal-set constants.
         if terminal_backup_mode not in ("legacy_inflated_ellipse", "invariant_ellipse"):
             raise ValueError(f"Unknown terminal_backup_mode {terminal_backup_mode!r}")
         self.terminal_backup_mode = terminal_backup_mode
@@ -1648,9 +1586,9 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         self.terminal_rec_scale = float(terminal_rec_scale)
         if self.terminal_geom_scale <= 0.0 or self.terminal_rec_scale <= 0.0:
             raise ValueError("terminal_geom_scale/terminal_rec_scale must be positive")
-        # R_x = r_x + backup_margin, R_y = r_y + backup_margin -- FIXED, no
-        # residual-velocity inflation (that is exactly what "legacy" does and
-        # what makes the legacy terminal set not generally forward-invariant).
+        # R_x = r_x + backup_margin, R_y = r_y + backup_margin, with no
+        # residual-velocity inflation (the inflated legacy terminal set is not
+        # generally forward-invariant).
         self.terminal_big_r_x = self.axis_x + self.backup_margin
         self.terminal_big_r_y = self.axis_y + self.backup_margin
         self.terminal_c_theta = 0.5 * abs(
@@ -1673,9 +1611,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         f[:, 0] = c * vx - s * vy
         f[:, 1] = s * vx + c * vy
         f[:, 2] = wz
-        # Backup-policy dynamics: u_dot = -a * (u - u_target). u_target=None
-        # (the default everywhere except the backup flow's own call sites)
-        # reproduces the original "coast to a dead stop" field exactly.
+        # Backup-policy dynamics: u_dot = -a * (u - u_target); u_target=None is
+        # the zero ("coast to a stop") field.
         if u_target is None:
             f[:, 3:] = -a * z[:, 3:]
         else:
@@ -1759,13 +1696,9 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         all_lf.append(torch.sum(grad_psi_n * fhat0[:, None, :], dim=-1))
         all_lg.append(grad_psi_n[..., 3:] * a[None, None, :])
 
-        # Positive-time rollout terms. z0=[0,0,0,u] in the scan-fixed frame,
-        # so the exact zero-surrogate flow and its sensitivity Phi_B are the
-        # same closed-form solution used by the map-based bCBF filter (only
-        # the barrier evaluated along the flow differs: LiDAR points here
-        # instead of a global obstacle map). All samples are independent
-        # closed-form evaluations, computed in one vectorized call instead of
-        # a sequential fixed-step Euler rollout.
+        # Positive-time rollout terms. z0=[0,0,0,u] in the scan-fixed frame;
+        # the backup flow and its sensitivity Phi_B are evaluated in closed
+        # form at all sample times in one vectorized call.
         R = points.shape[1]
         num_samples = self.backup_samples - 1
         sample_times = self.backup_horizon_s * torch.arange(
@@ -1832,9 +1765,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
             grad_geom = torch.einsum("brm,bmj->brj", grad_geom_future, phi_terminal)
             grad_rec = torch.einsum("brm,bmj->brj", grad_rec_future, phi_terminal)
 
-            # Scale BEFORE masking so inactive rays stay pinned at exactly
-            # self.inactive_barrier_value regardless of the chosen scale
-            # (masking after scaling would shrink/grow the sentinel itself).
+            # Scale before masking so inactive rays stay at exactly
+            # self.inactive_barrier_value regardless of the scale.
             h_geom_n, grad_geom_n = self.mask_terms(
                 self.terminal_geom_scale * h_geom_future, valid, self.terminal_geom_scale * grad_geom
             )
@@ -1859,9 +1791,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
                 terms, lf_terms, lg_terms, self.kappa_backup
             )
         else:
-            # The non-LSE QP consumes the individual arrays below.  Return the
-            # hard-min row only for compatibility/diagnostics without computing
-            # an otherwise unused soft-min aggregation.
+            # The non-LSE QP consumes the individual rows; return the hard-min
+            # row for diagnostics and skip the soft-min aggregation.
             hard_index = terms.argmin(dim=1)
             batch_index = torch.arange(B, device=terms.device)
             h_backup = terms[batch_index, hard_index]
@@ -1911,12 +1842,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
         limits_lower = torch.as_tensor(self.limits_lower, device=current_command.device, dtype=current_command.dtype)
         limits_upper = torch.as_tensor(self.limits_upper, device=current_command.device, dtype=current_command.dtype)
         if self.legacy_projection:
-            # Pre-2026-09-07 behavior: project onto the CBF half-space alone
-            # (no box constraint baked into the projection itself), matching
-            # cbf_cd_cf's filter and every bcbf_cf checkpoint trained before
-            # that date. A naive post-hoc clamp (below) is the only place
-            # the command magnitude is bounded, which is exactly the
-            # inconsistency the joint projection below was built to fix.
+            # Project onto the CBF half-space alone (as in cbf_cd_cf); the
+            # command box is enforced only by the clamp below.
             decay = torch.exp(-a * self.dt)
             fallback = torch.zeros_like(desired_surrogate)
             surrogate, omega, lam, feasible, residual = _exact_projection(
@@ -1928,9 +1855,8 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
             )
             joint_infeasible = ~feasible
         else:
-            # Exact ZOH inversion: u_next = decay*u + (1-decay)*u_hat must
-            # satisfy the PHYSICAL box [limits_lower,limits_upper] -- this is
-            # a bound on u_hat, NOT the same as the physical bound itself
+            # Exact ZOH inversion: u_next = decay*u + (1-decay)*u_hat must lie
+            # in the physical box, which induces a (different) box on u_hat
             # (see zoh_surrogate_bounds).
             u_hat_lower, u_hat_upper, decay = zoh_surrogate_bounds(
                 current_command, limits_lower, limits_upper, a, self.dt
@@ -1944,27 +1870,20 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
                 eps=self.eps,
             )
         if self.straight_through:
-            # Same trick QpSolveDiagnostics-producing projectors use
-            # (bcbf_qp_filter.py's qp_solution = desired + (qp_solution -
-            # desired).detach()): the forward pass still executes the exact,
-            # correctly-projected `surrogate` below, but backprop sees
-            # d(surrogate)/d(desired_surrogate) = I instead of the true CBF-
-            # projection Jacobian -- isolates whether the closed-form
-            # filter's real differentiability (vs. an identity surrogate
-            # gradient) is what drives bcbf_cf's training benefit.
+            # Straight-through estimator: the forward pass executes the exact
+            # projection, but backprop sees d(surrogate)/d(desired) = I
+            # instead of the projection Jacobian.
             surrogate = desired_surrogate + (surrogate - desired_surrogate).detach()
         command_unclipped = decay * current_command + (1.0 - decay) * surrogate
         violation = torch.relu(torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)).max(dim=1).values
-        # Hard clip is kept as a final numerical/physical failsafe (Task 4);
-        # with the box already enforced inside the projection above, this
-        # should now be a no-op up to floating-point error.
+        # Final failsafe clip; a no-op up to floating-point error when the box
+        # is enforced inside the joint projection.
         command = torch.clamp(command_unclipped, limits_lower, limits_upper) if self.hard_clip_output else command_unclipped
         clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
 
-        # Task 5 (diagnostic only, does not feed back into the filter): the
-        # surrogate that would have exactly produced the ACTUALLY EXECUTED
-        # command through the same ZOH update, and its CBF residual.
+        # Diagnostic: CBF residual at the surrogate that reproduces the
+        # executed (post-clip) command through the ZOH update.
         one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
         u_hat_exec = (command - decay * current_command) / one_minus_decay
         residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
@@ -1990,9 +1909,6 @@ class LaserZeroBackupLseCbfClosedForm(_LocalScanPointGeometry):
             projection_feasible=feasible,
             projected_cbf_residual=residual,
             # D_aug = ||Lg_hat h_aug||^2, the exact-projection denominator.
-            # Diagnostic only -- `lg` here is the same aggregated gradient
-            # already used above for `omega`/`surrogate`; this does not
-            # change anything upstream, just exposes it for logging.
             lg_aug_sq_norm=torch.sum(lg.square(), dim=1),
             command_preclip=command_unclipped,
             joint_projection_infeasible=joint_infeasible,
@@ -2010,16 +1926,11 @@ def build_invariant_ellipse_bcbf_filter(
 ) -> LaserZeroBackupLseCbfClosedForm:
     """Construct the bCBF-CF invariant-ellipse filter from a LaserSafetyConfig.
 
-    Mirrors LaserSafeSacActor.__init__'s ``method == "bcbf_cf"`` branch
-    exactly (same kwargs, same source config fields) so that scenario
-    feasibility certification (reset-time reject/resample, and any offline
-    certified-subset generation) always evaluates h_aug(z0) with the SAME
-    geometry/terminal-set the actor's own filter would use -- never a
-    reimplementation that could silently drift from it. ``terminal_backup_mode``
-    is always forced to "invariant_ellipse" here (irrespective of what a given
-    training run's own method/config uses), since the invariant-ellipse
-    theorem is the one certification criterion Task 9 requires ALL methods to
-    share for a fair initial-state distribution.
+    Mirrors LaserSafeSacActor.__init__'s ``method == "bcbf_cf"`` branch (same
+    kwargs and config fields), so scenario feasibility certification evaluates
+    h_aug(z0) with the same geometry and terminal set as the actor's filter.
+    ``terminal_backup_mode`` is always "invariant_ellipse" so every method
+    shares one certification criterion and initial-state distribution.
     """
     return LaserZeroBackupLseCbfClosedForm(
         d_safe=safety_cfg.d_safe,
@@ -2193,32 +2104,18 @@ class LaserZeroBackupLseControlDynamicsQp(LaserZeroBackupLseCbfClosedForm):
 class LaserZeroBackupLseControlDynamicsQpCfMatched(LaserZeroBackupLseCbfClosedForm):
     """CF-matched differentiable-QP baseline for the laser bCBF-LSE-CD filter.
 
-    Builds the IDENTICAL single affine constraint that
-    LaserZeroBackupLseCbfClosedForm.filter() solves in closed form -- same
-    _backup_terms_and_lie (kappa_backup), same _input_lse_lie (kappa_input),
-    same outer LSE aggregation (kappa_outer) into one scalar h_aug/Lf/Lg row,
-    same alpha_outer, same desired_surrogate. This is the laser analogue of
-    ZeroBackupBcbfQpFilter's "cd_lse_qp_cfmatched" variant in
-    bcbf_qp_filter.py (see that module's docstring for the full derivation
-    and scripts/test_cf_matched_qp_regression.py for the map-based
-    forward/gradient regression tests against the closed form).
+    Builds the same single affine constraint that
+    LaserZeroBackupLseCbfClosedForm.filter() solves in closed form (same
+    kappa_backup/kappa_input/kappa_outer aggregation into one h_aug/Lf/Lg row,
+    same alpha_outer and desired_surrogate). Laser analogue of
+    ZeroBackupBcbfQpFilter's "cd_lse_qp_cfmatched" variant in bcbf_qp_filter.py.
 
-    Unlike LaserZeroBackupLseControlDynamicsQp (the existing QP variant,
-    whose default training backend is SmallBoxQpProjector with a
-    straight-through estimator), this class ALWAYS solves with
-    QpthProjector -- an exact batched differentiable QP/KKT solve, with no
-    .detach() on the actor path -- regardless of the qp_backend/
-    straight_through/max_active_candidates constructor arguments, which are
-    accepted only so LaserSafeSacActor.__init__ can pass this class the same
-    kwargs shape as every other QP filter and are otherwise unused here.
-
-    Also unlike LaserZeroBackupLseControlDynamicsQp (which does not
-    reproduce it), this class explicitly reproduces the closed form's
-    active-but-degenerate fallback (||Lg h_aug||^2 ~ 0 while still needing
-    correction -> zero surrogate) as a post-solve override, since a generic
-    QP solver has no notion of that project-specific convention and this
-    variant is meant to be a true apples-to-apples ablation on the
-    projection method alone.
+    Always solves with QpthProjector (exact batched differentiable KKT solve,
+    no .detach() on the actor path); qp_backend/straight_through/
+    max_active_candidates are accepted for a uniform constructor signature
+    but unused. The closed form's active-but-degenerate fallback
+    (||Lg h_aug||^2 ~ 0 while correction is needed -> zero surrogate) is
+    reproduced as a post-solve override, so only the projection method differs.
     """
 
     def __init__(
@@ -2322,9 +2219,8 @@ class LaserZeroBackupLseControlDynamicsQpCfMatched(LaserZeroBackupLseCbfClosedFo
         correction = surrogate - desired_surrogate
         feasible = diag.max_violation <= self.projector.feasibility_tol
 
-        # Diagnostic only: CBF residual at the surrogate that would exactly
-        # reproduce the ACTUALLY EXECUTED (post-clip) command through the
-        # same ZOH update (see LaserZeroBackupLseCbfClosedForm.filter()).
+        # Diagnostic: CBF residual at the surrogate that reproduces the
+        # executed (post-clip) command through the ZOH update.
         one_minus_decay = torch.clamp(1.0 - decay, min=self.eps)
         u_hat_exec = (command - decay * current_command) / one_minus_decay
         residual_exec = (lf + self.alpha_outer * h_aug) + torch.sum(lg * u_hat_exec, dim=1)
@@ -2357,34 +2253,23 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
     """bCBF-CD-LSE-Adapted: a control-dynamics bCBF-QP filter with an
     explicit admissible-input-set QP, matching Rabiee & Hoagg's formulation.
 
-    Unlike its LaserZeroBackupLseControlDynamicsQpCfMatched parent (which
-    takes the previously *executed* command as its command-dynamics state,
-    implicitly assuming the low-level policy tracks commands perfectly),
-    this class's state is the robot's measured body velocity
-    [vx, vy, wz] -- the dot v = -A v + A u_cmd model is evaluated against
-    the actual plant state, not a command-tracking surrogate for it.
+    Unlike its LaserZeroBackupLseControlDynamicsQpCfMatched parent (whose
+    command-dynamics state is the previously executed command, implicitly
+    assuming perfect tracking), the state here is the measured body velocity
+    [vx, vy, wz], so dot v = -A v + A u_cmd is evaluated on the actual plant.
 
-    Every backup-rollout time-sample x LiDAR ray term and every
-    terminal-set term are stacked together and soft-minned in one pass
-    (sharpness kappa_outer) into a single barrier row, enforced through an
-    exact QP (QpthProjector) over the surrogate command. The six velocity-
-    state input limits are NOT folded into that barrier/softmin -- they are
-    separate hard box constraints on the surrogate decision variable itself
-    (surrogate in [limits_lower, limits_upper]), so the admissible input set
-    is exact rather than approximated through a barrier margin. kappa_backup/
-    kappa_input/tracking_sigma are accepted (inherited constructor) but
-    unused by this class's filter().
+    All backup-rollout (time sample x LiDAR ray) and terminal-set terms are
+    soft-minned in one pass (kappa_outer) into a single barrier row, enforced
+    through an exact QP (QpthProjector) over the surrogate command. The input
+    limits are not folded into the barrier; they are hard box constraints on
+    the surrogate (surrogate in [limits_lower, limits_upper]), so the
+    admissible input set is exact. kappa_backup/kappa_input/tracking_sigma
+    are accepted (inherited constructor) but unused by filter().
 
-    The QP's unconstrained target is the nominal command itself, not the
-    sigma/feedforward-shaped surrogate the command-as-state parent uses. That
-    shaping exists there to counter a SECOND, virtual lag between the
-    command-history state and the real plant; it doesn't apply here, where
-    the state already IS the real plant velocity, and dot v = -a(v - u_cmd)
-    is the one real physical lag. Commanding u_cmd = nominal directly is the
-    minimal choice that reproduces exactly that single physical lag with no
-    extra filtering layered on top, matching the "project nominal, subject
-    to safety" convention every non-control-dynamics filter in this file
-    already uses.
+    The QP target is the nominal command itself, not the sigma/feedforward-
+    shaped surrogate of the command-as-state parent: that shaping compensates
+    a virtual lag between command history and plant, which does not exist
+    when the state is the plant velocity.
     """
 
     def filter(
@@ -2396,8 +2281,7 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
         previous_nominal_command: torch.Tensor | None = None,
         nominal_history_valid: torch.Tensor | None = None,
     ) -> LaserSafetyFilterResult:
-        # Accepted only for call-signature compatibility with every other
-        # control-dynamics filter -- unused here, see class docstring.
+        # Accepted for call-signature compatibility; unused (see class docstring).
         del previous_nominal_command, nominal_history_valid
         B = measured_velocity.shape[0]
 
@@ -2414,8 +2298,8 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
         limits_upper = torch.as_tensor(
             self.limits_upper, device=measured_velocity.device, dtype=measured_velocity.dtype
         )
-        # Diagnostic only (not fed into the QP): how close the CURRENT
-        # measured velocity already is to the box.
+        # Diagnostic only (not fed into the QP): normalized margin of the
+        # measured velocity to the box.
         input_terms = torch.stack(
             tuple(
                 value
@@ -2428,9 +2312,7 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
             dim=1,
         )
 
-        # The QP's unconstrained target is simply the nominal command --
-        # see class docstring for why no sigma/feedforward shaping belongs
-        # here once the state is the real plant velocity.
+        # QP target is the nominal command (see class docstring).
         desired_surrogate = nominal_command
 
         omega = lf + torch.sum(lg * desired_surrogate, dim=1) + self.alpha_outer * h_aug
@@ -2447,25 +2329,17 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
         # Row 0: lf + lg uhat + alpha(h) >= 0  <=>  -lg uhat <= lf + alpha(h).
         barrier_A = -lg[:, None, :]
         barrier_b = (lf + self.alpha_outer * h_aug)[:, None]
-        # The "active-but-degenerate" case (||Lg h_aug||^2 ~ 0 while still
-        # needing correction) always gets its surrogate overridden to zero
-        # below, regardless of what the solver returns for it. Feeding qpth
-        # the TRUE row for those envs -- an all-zero-gradient row paired
-        # with an already-violated (negative) margin -- makes that single
-        # row unsatisfiable by any u, independent of the box rows, which can
-        # make the batched KKT factorization pathologically slow or hang for
-        # the WHOLE batch, not just the degenerate envs. Since its answer is
-        # discarded anyway, replace that row with an inert, always-satisfied
-        # one (A=0, b=+large) for exactly those envs before the solve, so
-        # the solver is never handed a row with no solution.
+        # Active-but-degenerate rows (||Lg h_aug||^2 ~ 0, correction needed)
+        # are unsatisfiable by any u and can stall the batched KKT solve for
+        # the whole batch. Their surrogate is overridden to zero below anyway,
+        # so replace them with an inert row (A=0, b=+large) before the solve.
         degenerate_row_mask = degenerate_active[:, None, None]
         barrier_A = torch.where(degenerate_row_mask, torch.zeros_like(barrier_A), barrier_A)
         barrier_b = torch.where(
             degenerate_active[:, None], torch.full_like(barrier_b, 1.0e6), barrier_b
         )
-        # Rows 1-6: exact box constraint on the surrogate decision variable
-        # itself -- surrogate_j <= upper_j and -surrogate_j <= -lower_j for
-        # each axis j -- independent of any barrier/alpha/kappa choice.
+        # Rows 1-6: exact box on the surrogate, surrogate_j <= upper_j and
+        # -surrogate_j <= -lower_j per axis j.
         eye3 = torch.eye(3, device=measured_velocity.device, dtype=measured_velocity.dtype)
         box_A = torch.stack(
             tuple(row for j in range(3) for row in (eye3[j], -eye3[j])), dim=0
@@ -2481,15 +2355,10 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
             degenerate_active[:, None], torch.zeros_like(qp_surrogate), qp_surrogate
         )
 
-        # surrogate IS the velocity command u_cmd to execute. measured_velocity
-        # is the real plant's own state, not something this filter sets, so
-        # there is no "blend toward the surrogate" step here the way the
-        # command-as-state parent has -- there, that blend WAS the state's
-        # own update rule, so the blended value and the executed command
-        # were the same quantity by construction. Executing anything other
-        # than the solved surrogate directly (e.g. blending in the stale
-        # measured state) can violate the very bound/barrier the QP just
-        # enforced on u_cmd itself.
+        # The surrogate is the executed velocity command u_cmd. The state is
+        # the measured plant velocity, not a filter-owned command state, so
+        # there is no ZOH blend; blending would break the constraints the QP
+        # enforced on u_cmd.
         command_unclipped = surrogate
         violation = torch.relu(
             torch.maximum(limits_lower - command_unclipped, command_unclipped - limits_upper)
@@ -2500,20 +2369,13 @@ class LaserZeroBackupCdLseAdapted(LaserZeroBackupLseControlDynamicsQpCfMatched):
         )
         clip_delta = torch.linalg.norm(command - command_unclipped, dim=1)
         correction = surrogate - desired_surrogate
-        # The solver only ever sees the degenerate row after it has been
-        # masked to an inert placeholder above, so its own feasibility
-        # diagnostics describe that MODIFIED (box-only) problem for those
-        # envs, not the true one. The true barrier row for every
-        # degenerate_active env is unsatisfiable by any u, independent of
-        # the box, by construction of that branch -- never report those as
-        # feasible regardless of what the masked solve says.
+        # Degenerate-active envs were solved with a masked row, and their true
+        # barrier row is unsatisfiable, so never report them as feasible.
         feasible = (diag.max_violation <= self.projector.feasibility_tol) & (~degenerate_active)
 
-        # The CBF residual at the command actually executed, using the TRUE
-        # (unmasked) barrier Lie derivatives -- distinct from
-        # projected_cbf_residual below, which is the QP solver's own slack
-        # over whatever rows it was actually handed (box-only, for
-        # degenerate envs), mixing barrier and box slack together.
+        # CBF residual at the executed command with the unmasked barrier row;
+        # projected_cbf_residual is instead the solver's slack over the rows
+        # it was given (barrier and box mixed).
         residual_exec = lf + torch.sum(lg * command, dim=1) + self.alpha_outer * h_aug
 
         return LaserSafetyFilterResult(
@@ -2561,8 +2423,7 @@ class LaserZeroBackupCbfQp(LaserZeroBackupLseCbfClosedForm):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        # Local import avoids coupling the closed-form module to the legacy
-        # map-based QP code unless this method is selected.
+        # Local import: the QP projectors are only needed when this method is selected.
         from .bcbf_qp_filter import OsqpProjector, QpthProjector, SmallBoxQpProjector
 
         if qp_backend == "active_set":
@@ -2645,23 +2506,12 @@ class LaserZeroBackupCbfQp(LaserZeroBackupLseCbfClosedForm):
             backup_terms, backup_lf, backup_lg, self.kappa_backup
         )
         # One backup LSE row plus six individual command-state input rows.
-        # The six input rows use alpha=a (the per-axis control-dynamics gain,
-        # matching the historical Model-Based/bcbf_lse_circle_obstacles_v4_cd.c
-        # reference's dedicated input-row alpha, distinct from alpha_outer),
-        # NOT alpha_outer -- alpha_outer is calibrated for the aggregated
-        # backup+input LSE row used by the closed-form/LSE-QP filters, where
-        # the six raw input rows are softened through kappa_input before
-        # alpha_outer ever applies to them, and that softmin combination
-        # cancels almost exactly at the box center (u=0), leaving that row
-        # nearly inert there. This class enforces the six rows individually
-        # (that is the point of the QP), so reusing alpha_outer directly on
-        # the raw, un-softened rows made them ~10x too restrictive even at
-        # the box center, far from any real obstacle or input-limit
-        # constraint (verified: with alpha_outer=0.8, a=8.0, limit=0.5, the
-        # row bound at u=0 is 0.05 instead of the physical 0.5). Setting each
-        # row's alpha to that axis's own `a` makes the bound reduce to
-        # exactly the physical limit independent of current_command, i.e.
-        # "surrogate must lie in the box" -- the intended behavior.
+        # The input rows use alpha=a (per-axis control-dynamics gain) rather
+        # than alpha_outer, which is calibrated for the soft-minned aggregate
+        # row. With alpha=a each row's bound reduces exactly to the physical
+        # limit independent of current_command ("surrogate lies in the box");
+        # alpha_outer on the raw rows would be far too restrictive (e.g.
+        # alpha_outer=0.8, a=8, limit=0.5 gives a bound of 0.05 at u=0).
         alpha_input_rows = a.repeat_interleave(2)
         all_terms = torch.cat((h_backup[:, None], input_terms), dim=1)
         all_lf = torch.cat((lf_backup[:, None], input_lf), dim=1)
@@ -2767,9 +2617,7 @@ class LaserZeroBackupNonLseControlDynamicsQp(LaserZeroBackupCbfQp):
         all_terms = torch.cat((backup_terms, input_terms), dim=1)
         all_lf = torch.cat((backup_lf, input_lf), dim=1)
         all_lg = torch.cat((backup_lg, input_lg), dim=1)
-        # Same fix as LaserZeroBackupCbfQp.filter(): the six individual
-        # input-limit rows use alpha=a (per-axis control-dynamics gain), not
-        # alpha_outer -- see that method's comment for the full derivation.
+        # Input-limit rows use alpha=a, as in LaserZeroBackupCbfQp.filter().
         num_backup_rows = backup_terms.shape[1]
         alpha_input_rows = a.repeat_interleave(2)
         alpha_rows = torch.cat((
@@ -2852,31 +2700,23 @@ class LaserZeroBackupLseQp(LaserScanCbfLseQp):
     scripts/benchmark_safety_filter_latency.py).
 
     Under this kinematic (no-lag) model the backup law is exactly zero
-    velocity, so the robot pose -- and every scan-fixed ray point, since the
-    LiDAR is body-mounted -- stays fixed for the whole backup horizon: there
-    is no flow to integrate and no sensitivity matrix to propagate (both the
-    exact closed-form flow of LaserZeroBackupLseCbfClosedForm and this
-    class's backup-rollout cost collapse to repeating the SAME current-time
-    barrier). Concretely:
+    velocity, so the robot pose and every scan-fixed ray point stay fixed
+    over the backup horizon: there is no flow or sensitivity to propagate.
+    The barrier rows are:
       * `backup_samples` identical copies of the current-time ray barrier
-        (`current_h_and_direct_row`) -- kept only for row-count/compute
-        parity with the control-dynamics variant's distinct backup-flow
-        samples, since softmin-aggregating identical terms is a no-op;
-      * one terminal ray barrier, same points, footprint inflated by
-        `backup_margin` (no residual-velocity stopping-distance term --
-        there is no coasting velocity to account for when the backup
-        command is exactly zero);
-    all soft-min aggregated (kappa_backup) into a single row, then combined
-    with the six hard command-box rows into a 7-row QP -- the direct-command
-    analogue of LaserZeroBackupCbfQp (which keeps the control-dynamics
-    surrogate state).
+        (`current_h_and_direct_row`), kept for row-count/compute parity with
+        the control-dynamics variant (soft-minning identical terms is a
+        no-op);
+      * one terminal ray barrier with the footprint inflated by
+        `backup_margin` (no stopping-distance term, since the zero backup
+        command never coasts);
+    soft-min aggregated (kappa_backup) into one row and combined with the six
+    hard command-box rows into a 7-row QP, the direct-command analogue of
+    LaserZeroBackupCbfQp.
 
-    Accepts the same 6-positional-argument ``filter(...)`` signature as
-    every control-dynamics laser filter so it is a drop-in addition to
-    benchmark/ablation harnesses that call every filter uniformly;
-    `current_command`, `previous_nominal_command`, and
-    `nominal_history_valid` are accepted but unused (there is no command
-    state here for them to describe).
+    Uses the same 6-argument ``filter(...)`` signature as the control-dynamics
+    filters; `current_command`, `previous_nominal_command`, and
+    `nominal_history_valid` are accepted but unused.
     """
 
     def __init__(
@@ -2957,10 +2797,8 @@ class LaserZeroBackupLseQp(LaserScanCbfLseQp):
         correction = command_unclipped - nominal_command
         feasible = diag.max_violation <= self.projector.feasibility_tol
 
-        # Diagnostic only: CBF condition re-evaluated at the ACTUALLY
-        # EXECUTED (post-clip) command `u` directly -- no ZOH/surrogate
-        # inversion needed here since this filter has no command-dynamics
-        # state (the QP decision variable already IS the applied command).
+        # Diagnostic: CBF residual at the executed (post-clip) command; no ZOH
+        # inversion since the QP decision variable is the applied command.
         residual_exec = self.alpha * h_backup + torch.sum(lg_backup * command, dim=1)
 
         return LaserSafetyFilterResult(

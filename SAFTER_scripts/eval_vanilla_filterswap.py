@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
-"""Filter-swap evaluation: take the RAW nominal command from a trained
-vanilla (no-safety-filter) SAC policy -- the nominal asymmetric-limit
-high-speed checkpoint (max_vx=2.0, min_vx=-1.0, max_vy=1.0, max_wz=1.0,
-360 deg/120-ray LiDAR, 10Hz high-level/50Hz low-level, handcrafted2) -- and
-retrofit EITHER SAFTER (LaserZeroBackupLseCbfClosedForm) or the no-CD
-bCBF-LSE-QP (LaserZeroBackupLseQp) onto it at evaluation time, on the three
-structured maps (low_shift/medium_shift/high_shift).
+"""Filter-swap evaluation on the structured low/medium/high-shift maps.
 
-This answers: how much does each filter actually correct a policy that
-never trained with a safety filter at all, compared to the obstacle-blind
-analytic heuristic controller used in eval_heuristic_vs_sac.py
-(--nominal-source heuristic)? The vanilla policy at least has LiDAR in
-its observation (even though nothing forced it to use that information
-safely), unlike the pure P-controller.
+Takes the raw (pre-filter) nominal command of one SAC checkpoint
+(--vanilla-checkpoint) and applies the safety filter chosen with --filter-type
+at evaluation time, so filters can be compared on the same nominal policy.
+Filters: safter (closed-form bCBF), bcbf_lse_qp, bcbf_lse_cd_qp,
+bcbf_lse_cd_qp_cfmatched and bcbf_cd_lse_adapted.
 
-Reuses build_environment/load_actor/timed_deterministic_actor/
-row_to_scenario/manifest machinery from the structured eval driver, and the
-retrofit-filter-construction pattern from evaluate_ablation_filter_swap.py
-(extended here with a "bcbf_lse_qp" branch for the no-CD filter, which
-that script doesn't support).
-
-CSV schema matches eval_heuristic_vs_sac.py; method name is
-"vanilla_nominal_<filter-type>" (e.g. "vanilla_nominal_safter",
-"vanilla_nominal_bcbf_lse_qp"). With --log-trajectories, also writes a
-per-step "<method_name>_trajectory.csv" (position/yaw history against the
-map, plus nominal/safe control-input history) alongside the episodes and
-summary CSVs, same schema as eval_heuristic_vs_sac.py's trajectory CSV.
+Episode and summary CSVs are written per seed and map under the method name
+"vanilla_nominal_<filter-type>", including per-step policy and filter inference
+times. --log-trajectories adds a per-step trajectory CSV (pose, nominal and
+safe commands, filter diagnostics).
 """
 from __future__ import annotations
 
@@ -83,9 +68,8 @@ from SAFTER_scripts.laser_unseen_eval.evaluate_laser_unseen_maps_structured impo
 
 TASK_ID = "Unitree-Go2-Safe-Navigation"
 DEFAULT_LOW_CHECKPOINT = "logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt"
-# The asymmetric-limit high-speed vanilla checkpoint (360 FOV/120 rays,
-# 10Hz/50Hz, handcrafted2, max_vx=2.0/min_vx=-1.0/max_vy=1.0/max_wz=1.0,
-# target_vector_steps=80000).
+# Vanilla SAC: 360 deg/120-ray LiDAR, 10 Hz/50 Hz, handcrafted2 maps,
+# command limits vx in [-1, 2], |vy| <= 1, |wz| <= 1.
 DEFAULT_VANILLA_CHECKPOINT = (
     "logs/sac_laser/go2_safe_navigation_sac_laser_vanilla/"
     "2026-09-14_00-25-56_vanilla_10hz_seaspeed_seed0/model_step_80000.pt"
@@ -159,16 +143,8 @@ def build_retrofit_filter(filter_type: str, cfg, action_limits: tuple[float, flo
             **kwargs,
         )
     if filter_type == "bcbf_lse_cd_qp":
-        # The control-dynamics (velocity-as-state) counterpart of
-        # "bcbf_lse_qp" above -- QP synthesis of the SAME augmented LSE
-        # barrier SAFTER itself uses (same command dynamics/backup/terminal
-        # model as the "safter" branch), differing only in how the resulting
-        # affine constraint is solved (QP projector here vs SAFTER's
-        # analytical closed form). This is the Rabiee & Hoagg (2025)
-        # adaptation's actually-matched baseline -- their own paper models
-        # body velocity as a state with a hard-bounded acceleration input,
-        # which is a control-dynamics structure, not the plain hard-box-on-
-        # velocity "bcbf_lse_qp" branch above.
+        # SAFTER's augmented LSE barrier and control-dynamics model, solved as
+        # a QP instead of in closed form.
         return LaserZeroBackupLseControlDynamicsQp(
             backup_margin=safety_cfg.backup_margin,
             backup_horizon_s=safety_cfg.backup_horizon_s,
@@ -195,13 +171,8 @@ def build_retrofit_filter(filter_type: str, cfg, action_limits: tuple[float, flo
             **kwargs,
         )
     if filter_type == "bcbf_lse_cd_qp_cfmatched":
-        # The exact-differentiable-QP (QpthProjector) counterpart of
-        # bcbf_lse_cd_qp above -- same composite LSE barrier/backup/terminal
-        # model, but always solves with an exact batched QP/KKT solve
-        # instead of the straight-through active-set approximation. Meant
-        # to be paired with a policy actually TRAINED under this same
-        # cfmatched filter (e.g. go2_safe_navigation_sac_laser_bcbf_lse_cd_qp_cfmatched
-        # checkpoints), not retrofitted onto a mismatched policy.
+        # Same model as bcbf_lse_cd_qp, solved with an exact batched QP
+        # (QpthProjector) rather than the active-set approximation.
         return LaserZeroBackupLseControlDynamicsQpCfMatched(
             backup_margin=safety_cfg.backup_margin,
             backup_horizon_s=safety_cfg.backup_horizon_s,
@@ -282,9 +253,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-duration-s", type=float, default=90.0)
     parser.add_argument("--vanilla-checkpoint", default=DEFAULT_VANILLA_CHECKPOINT)
     parser.add_argument("--low-level-checkpoint", default=DEFAULT_LOW_CHECKPOINT)
-    # Matches the vanilla checkpoint's own trained configuration exactly
-    # (its saved config) -- load_actor() strictly checks laser/safety
-    # against this.
+    # Must match the checkpoint's training configuration (load_actor checks it).
     parser.add_argument("--laser-num-rays", type=int, default=120)
     parser.add_argument("--laser-fov-deg", type=float, default=360.0)
     parser.add_argument("--collision-geometry", choices=("circle", "ellipse"), default="circle")
@@ -409,9 +378,7 @@ def evaluate_map(
     )
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
-    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters
-    # -- see evaluate_laser_unseen_maps_structured.evaluate_method_vectorized
-    # for the full rationale.
+    # Step-weighted (pooled) clip and barrier counters.
     pooled_diag_steps = 0
     pooled_clip_steps = 0
     pooled_clip_violation_steps = 0
@@ -458,20 +425,12 @@ def evaluate_map(
 
             with torch.no_grad():
                 while not all(finished):
-                    # Only needed for the trajectory CSV's yaw_rad column; the
-                    # nominal command itself comes from actor_obs, not from a
-                    # manual position/yaw query.
+                    # Yaw is only used for the trajectory CSV.
                     _, pre_yaws = env.safety_context()
                     actor_obs = env.actor_tensor(obs)
-                    # policy_ms times only the MLP backbone + tanh (see
-                    # timed_deterministic_actor); the actor's own native
-                    # apply_safety() call inside it runs unavoidably but is
-                    # excluded from this window, so policy_ms stays a clean
-                    # "pure policy forward pass" number. The discarded
-                    # _native_filter_ms/_native_total_ms below time that
-                    # unused native filter call, not the retrofit filter
-                    # actually being evaluated -- that one is timed
-                    # separately as filter_ms right below.
+                    # policy_ms covers only the policy forward pass. The actor's
+                    # own (unused) filter call is discarded; the retrofit filter
+                    # is timed below as filter_ms.
                     nominal, _safe, safety, policy_ms, _native_filter_ms, _native_total_ms = (
                         timed_deterministic_actor(actor, actor_obs)
                     )
@@ -483,17 +442,10 @@ def evaluate_map(
                     if filter_type in (
                         "safter", "bcbf_lse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted",
                     ):
-                        # All four are control-dynamics (velocity-as-state)
-                        # filters -- they need the env's own tracked
-                        # previous-nominal-command/history-valid observation
-                        # slices, same as SAFTER's own actor uses internally.
-                        # bcbf_cd_lse_adapted alone takes measured body
-                        # velocity (actor_obs[:, 2:5]) as its state, rather
-                        # than the previously executed command
-                        # (actor_obs[:, 5:8]) the other three use -- see
-                        # LaserZeroBackupCdLseAdapted's docstring. Only the
-                        # no-CD bcbf_lse_qp filter below has no such state
-                        # to feed.
+                        # Control-dynamics filters. The adapted filter's state is
+                        # the measured body velocity (actor_obs[:, 2:5]); the
+                        # others use the previously executed command
+                        # (actor_obs[:, 5:8]).
                         command_state = (
                             actor_obs[:, 2:5] if filter_type == "bcbf_cd_lse_adapted" else actor_obs[:, 5:8]
                         )
@@ -549,11 +501,9 @@ def evaluate_map(
                         filter_active = correction_value > 1e-8
                         active_steps[env_id] += int(filter_active)
 
-                        # Diagnostic: how often the retrofit filter's
-                        # own hard clip changes the command, and whether the
-                        # as-executed command (`retrofit.command`, matching
-                        # `applied` here since action_limits are identical)
-                        # still satisfies the CBF condition.
+                        # How often the filter's hard clip changes the command,
+                        # and whether the executed command satisfies the CBF
+                        # condition.
                         clip_delta_flags = getattr(retrofit, "clip_delta", None)
                         if clip_delta_flags is not None:
                             clip_delta_value = float(clip_delta_flags[env_id].detach().cpu())

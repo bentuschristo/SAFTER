@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Live MuJoCo-viewer playback of the bCBF-CF policy (safety filter ACTIVE,
-normal deployment) on one of the 5 TRAINING procedural maps
-(generated/procedural_maps/handcrafted2), with LiDAR rays visualized.
+"""Live MuJoCo-viewer playback of the bCBF-CF policy with the safety filter
+active on one of the 5 training procedural maps (handcrafted2), with LiDAR
+rays visualized.
 
-Cycles through every SUCCESSFUL (evaluation_seed, case_id, scenario_id)
-recorded in the prior training_maps_filter_active eval run for the chosen
-map_id -- each episode ends, the viewer immediately teleports to the next
-successful case, looping back to the first once the list is exhausted.
+Cycles through every successful (evaluation_seed, case_id, scenario_id)
+recorded in a training_maps_filter_active evaluation run for the chosen
+map_id: when an episode ends, the viewer moves to the next successful case
+and loops back at the end.
 
-Reuses build_environment/load_actor from evaluate_training_maps_no_filter.py
-(same procedural map bank machinery, same [-1, 2] vx / +-1 vy / +-1 wz /
-backup_margin=0.6 / invariant-ellipse terminal-set config as every other
-bcbf_cf evaluation this session) and DeterministicLaserPolicy from the
-interactive play script.
+Uses build_environment/load_actor from evaluate_training_maps_no_filter.py
+(same procedural map bank, [-1, 2] vx / +-1 vy / +-1 wz limits,
+backup_margin=0.6 and invariant-ellipse terminal set) and
+DeterministicLaserPolicy from the interactive play script.
 """
 from __future__ import annotations
 
@@ -116,7 +115,7 @@ def main() -> None:
     parser.add_argument("--eval-root", default=None,
                          help="Existing training_maps_filter_active run whose episodes.csv records "
                               "which (map_id, scenario_id) cases succeeded. Defaults to the most "
-                              "recent such run used this session.")
+                              "recent such run.")
     parser.add_argument("--evaluation-seeds", type=int, nargs="+", default=None,
                          help="Restrict to specific evaluation seeds (default: all seeds present).")
     parser.add_argument("--episode-duration-s", type=float, default=60.0)

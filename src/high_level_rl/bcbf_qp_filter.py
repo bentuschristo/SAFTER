@@ -107,7 +107,6 @@ class SmallBoxQpProjector:
         weights = weights.to(device=device, dtype=dtype).clamp_min(self.regularization)
         winv = 1.0 / weights
 
-        # First check if the desired command is already feasible.
         violation = A @ desired[:, :, None]
         violation = violation.squeeze(-1) - b
         feasible_desired = violation.max(dim=1).values <= self.feasibility_tol
@@ -360,8 +359,7 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
         only affect the other variants. Intended as an apples-to-apples
         ablation against the closed form: same terms, same gradients, same
         ZOH propagation and degenerate fallback -- only the projection
-        solver differs (QP vs. hand-derived analytic KKT formula). See
-        scripts/test_cf_matched_qp_regression.py.
+        solver differs (QP vs. hand-derived analytic KKT formula).
 
     All variants except cd_lse_qp_cfmatched are intended for SAC ablation
     training via the batched active-set QP (SmallBoxQpProjector), which uses
@@ -384,12 +382,8 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
             max_candidates=max_active_candidates,
             straight_through=straight_through,
         )
-        # cd_lse_qp_cfmatched always solves its single affine constraint with
-        # the exact differentiable QP backend, independent of the
-        # straight_through argument above (which only governs the other,
-        # multi-row variants' SmallBoxQpProjector). Constructing this is
-        # cheap and side-effect-free (qpth is imported lazily inside
-        # QpthProjector.project, not here), so it is always available.
+        # cd_lse_qp_cfmatched always uses the exact differentiable QP backend,
+        # regardless of straight_through; qpth is imported lazily, so this is cheap.
         self.cfmatched_projector = QpthProjector(
             feasibility_tol=1.0e-6,
             regularization=1.0e-6,
@@ -472,7 +466,6 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normal direct-command CBF-QP with hard input limits.
 
-        This is the Python/RL analogue of cbf_circle_obstacles_qp_lim.c:
             min_u 0.5 ||u-u_nom||_W^2
             s.t.  -L_g h_i(x) u <= alpha h_i(x)  for obstacles/walls
                   u_min <= u <= u_max
@@ -573,13 +566,9 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
         obstacle_radii: torch.Tensor,
         obstacle_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Zero backup for the non-CD kinematic model leaves p,yaw fixed, so
-        # positive-time samples duplicate the current safe-set terms.  Keeping
-        # the samples preserves the uploaded C-script structure, while the
-        # terminal terms use the enlarged backup set. For non-LSE variants, these terminal terms remain individual QP rows; no soft-min/LSE aggregation is used.
-        # Since every positive-time sample is identical (p,yaw do not evolve),
-        # it is computed once and repeated instead of recomputed `samples`
-        # times.
+        # The zero backup of the non-CD kinematic model leaves p, yaw fixed, so every
+        # positive-time sample equals the current safe-set terms: compute once and
+        # repeat. Terminal terms use the enlarged backup set (individual rows, no LSE).
         samples = max(int(self.cfg.backup_samples), 2)
         h, g = self._direct_primitive_terms_and_grads(
             position_w, yaw, obstacle_centers, obstacle_radii, obstacle_mask, terminal=False
@@ -681,7 +670,7 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
             b_backup = lf + self._cfg_float("alpha_outer", 0.8) * terms
             h_log = terms.min(dim=1).values  # hard minimum only for logging; non-LSE QP rows are individual
 
-        # Command-state input-limit CBF rows, same logic as the uploaded CD C script.
+        # Command-state input-limit CBF rows.
         limits = self._limits(current_command.device, current_command.dtype)
         alpha_u = float(getattr(self.cfg, "alpha_input", 2.0))
         A_in = torch.zeros(current_command.shape[0], 6, 3, device=current_command.device, dtype=current_command.dtype)
@@ -855,8 +844,7 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
         actor path), instead of the closed form's hand-derived analytic KKT
         formula. For a single affine constraint the two solve the same
         convex problem, so surrogate/command/residual and the actor-facing
-        gradient should agree to solver tolerance -- that equivalence is
-        exactly what scripts/test_cf_matched_qp_regression.py checks.
+        gradient should agree to solver tolerance.
 
         The CF's active-but-degenerate fallback (||Lg h_aug||^2/W ~ 0 while
         the constraint is still violated at the desired surrogate) is
@@ -934,10 +922,8 @@ class ZeroBackupBcbfQpFilter(ZeroBackupLseCbfClosedForm):
         nondegenerate = denominator_raw > eps
         degenerate_active = needs_correction & (~nondegenerate)
 
-        # Same diagnostic Lagrange multiplier CF would report -- solver
-        # independent (a single-halfspace QP's dual variable has this exact
-        # closed form regardless of which primal solver produced uhat*), so
-        # this is not "cheating": it does not feed into surrogate/command.
+        # Diagnostic Lagrange multiplier in closed form (exact for a single-halfspace
+        # QP regardless of the primal solver); it does not affect the command.
         lambda_value = torch.where(
             needs_correction & nondegenerate,
             -omega / torch.clamp(denominator_raw, min=eps),

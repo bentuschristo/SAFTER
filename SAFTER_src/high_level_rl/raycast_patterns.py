@@ -1,7 +1,3 @@
-# NOTE: this is a DUPLICATE of src/high_level_rl/raycast_patterns.py, kept
-# in sync manually -- also load-bearing for map-based scripts that stay
-# outside SAFTER_src. See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 import math

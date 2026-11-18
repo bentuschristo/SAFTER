@@ -80,20 +80,13 @@ class TrainLaserSacConfig:
     collision_margin_m: float = 0.05
     hard_clip_output: bool = True
     qp_backend: QpBackend = "active_set"
-    # bcbf_cf-only "sidestep-then-stop" backup controller (ignored by every
-    # other method). backup_target_vy=0 (default) reproduces the original
-    # zero-backup ("coast to a dead stop") controller bit-for-bit. Nonzero
-    # backup_target_vy makes the backup policy transiently sidestep by that
-    # amount before its own intent fades (rate backup_intent_decay_rate) and
-    # the backup trajectory settles back to rest -- the terminal sets are the
-    # same as for the zero-backup controller. See
-    # SafetyConfig.backup_target_command.
+    # bcbf_cf only: backup_target_vy=0 is the zero-backup (coast-to-stop)
+    # controller; a nonzero value sidesteps transiently while the intent decays
+    # at backup_intent_decay_rate. Terminal sets are unchanged.
     backup_target_vy: float = 0.0
     backup_intent_decay_rate: float = 2.0
-    # Original three-hidden-layer SAC MLP. Capacity ablations can override this
-    # with a comma-separated CLI value.
-    # Comma-separated because the task launcher performs two-stage CLI parsing;
-    # a variable-length tuple would lose all but its first value in stage one.
+    # Comma-separated because the two-stage CLI parsing would truncate a
+    # variable-length tuple to its first value.
     hidden_dims: str = "512,256,128"
     procedural_map_bank: str = "Maps/Training Maps/handcrafted2"
     save_replay_buffer: bool = False
@@ -105,21 +98,13 @@ class TrainLaserSacConfig:
     curriculum_recent_window: int = 10_000
     curriculum_mode: Literal["quarters", "seanav_adaptive"] = "quarters"
     enable_collision_initialization: bool = False
-    # Lightweight, off-by-default training-time diagnostics for the
-    # invariant-ellipse terminal backup set (min E_i/h_B_geom/h_B_rec,
-    # D_aug, Omega, correction norm, intervention rate, terminal-dominant-ray
-    # fraction, and near-degenerate/NaN/fallback event counts), aggregated
-    # over each log_interval and written under the "BcbfDiag/" TensorBoard
-    # tag. Only meaningful for --method bcbf_cf with
-    # --config.safety.terminal-backup-mode invariant_ellipse; a warning is
-    # printed and nothing is logged otherwise.
+    # Invariant-ellipse backup-set diagnostics logged under "BcbfDiag/"
+    # (bcbf_cf with terminal-backup-mode invariant_ellipse only).
     enable_bcbf_diagnostics: bool = False
     collision_initialization_probability: float = 0.80
     collision_undo_time_min_s: float = 2.0
     collision_undo_time_max_s: float = 3.0
     config: LaserSacConfig = field(default_factory=LaserSacConfig)
-    # The default is the standard training profile; only the dedicated
-    # SEA-Nav launcher overrides this field.
     training_profile: Literal[
         "original", "seanav_comparable_10hz", "seanav_comparable_50hz"
     ] = "original"
@@ -134,14 +119,9 @@ def apply_training_profile(cfg: TrainLaserSacConfig) -> TrainLaserSacConfig:
 
     if cfg.training_profile == "seanav_comparable_10hz":
         reward = replace(cfg.config.reward, profile="seanav_comparable")
-        # Preserve the established hierarchy: policy/LiDAR/filter at 10 Hz,
-        # with five frozen low-level controller steps at 50 Hz. SEA-Nav reward
-        # scales are multiplied by this 0.10 s policy interval in the env.
-        # curriculum_mode is intentionally left as whatever the caller/CLI
-        # already set (default "quarters", the static progress-based ramp
-        # used elsewhere) rather than forced to "seanav_adaptive" here, so
-        # `--curriculum-mode` controls this independently of the reward/timing
-        # profile.
+        # Policy/LiDAR/filter at 10 Hz over five 50 Hz low-level steps; the
+        # SEA-Nav reward scales are multiplied by the 0.10 s policy interval.
+        # curriculum_mode is left to --curriculum-mode.
         return replace(
             cfg,
             config=replace(cfg.config, reward=reward),
@@ -159,8 +139,6 @@ def apply_training_profile(cfg: TrainLaserSacConfig) -> TrainLaserSacConfig:
         integration_dt=0.02,
         backup_rollout_substeps=10,
     )
-    # Preserve the existing controlled-comparison 50 Hz profile, including its
-    # legacy shaping terms, so old commands and checkpoints remain compatible.
     reward = replace(cfg.config.reward, profile="seanav_comparable")
     return replace(
         cfg,
@@ -171,10 +149,8 @@ def apply_training_profile(cfg: TrainLaserSacConfig) -> TrainLaserSacConfig:
 def make_walls_only_arena_cfg(arena=None) -> EntityCfg:
     """Create physical walls whose inner faces match the active map bank.
 
-    Procedural maps are map-local in every MuJoCo-Warp world.  Building these
-    walls from the bank arena (instead of the legacy fixed Go2 arena) keeps
-    wall LiDAR returns, workspace termination, and analytical CBF geometry on
-    the same coordinates.  The optional fallback preserves old callers.
+    Building the walls from the bank arena keeps wall LiDAR returns, workspace
+    termination and the analytical CBF geometry in the same coordinates.
     """
     if arena is None:
         original_obstacles = physical_arena_cfg.OBSTACLES
@@ -282,16 +258,8 @@ def add_navigation_laser_sensor(env_cfg, cfg: LaserSacConfig) -> None:
     )
     extra_sensors: tuple = ()
     if contact.termination_mode == "direct_contact":
-        # These two contact sensors add real per-substep MuJoCo/mjWarp
-        # contact-kernel cost, and step_safe()'s per-substep force readout is
-        # their only consumer. "circle" mode never reads them, so skip
-        # creating them entirely in that mode rather than paying for sensors
-        # whose output is always discarded.
-        #
-        # The Go2 MJCF has no separately named head body. Its front/head
-        # collision geoms are base2_collision and base3_collision, while
-        # base1_collision is the trunk. This is the MuJoCo equivalent of
-        # SEA-Nav's base/head terminal contact set.
+        # Contact sensors cost per-substep compute and are only read in this
+        # mode. Terminal set: trunk (base1) and front/head (base2, base3) geoms.
         terminal_contact = ContactSensorCfg(
             name=contact.terminal_sensor_name,
             primary=ContactMatch(
@@ -305,9 +273,7 @@ def add_navigation_laser_sensor(env_cfg, cfg: LaserSacConfig) -> None:
             num_slots=1,
             global_frame=True,
         )
-        # Penalize all physical robot collision geoms except the four feet.
-        # This includes trunk/front, hip, thigh and calf contacts with
-        # terrain, walls, or procedural obstacles.
+        # Penalized set: every robot collision geom except the four feet.
         nonfoot_contact = ContactSensorCfg(
             name=contact.penalized_sensor_name,
             primary=ContactMatch(
@@ -338,22 +304,17 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
         cfg.procedural_map_bank,
         expected_num_maps=cfg.expected_num_maps,
         expected_scenarios_per_map=cfg.expected_scenarios_per_map,
-        # Slot capacity is authoritative bank metadata and is intentionally
-        # inferred here. Laser observations do not impose a fixed obstacle
-        # count, so users should not have to repeat it on the command line.
+        # Slot capacity comes from the bank metadata.
         expected_max_obstacles=None,
     )
     procedural_maps = procedural_map_bank.maps
-    # Per-slot shape ("circle"/"square"): every map places the same shape in
-    # a given physical slot index (resolve_slot_shapes enforces this), so a
-    # bank can mix circle and square obstacles across different slots.
+    # Each physical slot holds one shape (circle or square) across all maps.
     slot_shapes = resolve_slot_shapes(procedural_maps, procedural_map_bank.max_obstacles)
 
     env_cfg = load_env_cfg(task_id, play=False)
     low_agent_cfg = load_rl_cfg(task_id)
     env_cfg.scene.num_envs = cfg.num_envs
-    # Every map in a bank is required to share the arena geometry.  Use that
-    # geometry for the physical walls, not the legacy 15 m handcrafted arena.
+    # All maps in a bank share one arena; its geometry defines the walls.
     bank_arena = procedural_maps[0].arena
     if any(
         (item.arena.width, item.arena.length, item.arena.wall_thickness, item.arena.wall_height)
@@ -411,8 +372,6 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
     if not hidden_dims or any(width <= 0 for width in hidden_dims):
         raise ValueError(f"--hidden-dims must contain positive widths, got {cfg.hidden_dims!r}")
 
-    # Enable bounded, range-dependent LiDAR noise for training. Evaluation
-    # constructs the default LaserSacConfig, where noise remains disabled.
     training_laser_cfg = replace(
         cfg.config.laser,
         enable_lidar_noise=cfg.enable_lidar_noise,
@@ -420,9 +379,8 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
         fov_deg=float(cfg.laser_fov_deg),
         max_range=float(cfg.laser_max_range),
     )
-    # --safety-clearance is the desired front-ray threshold measured from the
-    # LiDAR origin.  Convert it to the
-    # additional body-footprint margin used by the local point-geometry CBF.
+    # --safety-clearance is the front-ray threshold from the LiDAR origin;
+    # convert it to the body-footprint margin used by the local CBF.
     base_safety = cfg.config.safety
     front_body_distance = max(
         0.5 * float(base_safety.robot_length_m) - float(base_safety.lidar_x_m),
@@ -446,8 +404,8 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
     for item in procedural_maps[1:]:
         if replace(item.arena, obstacles=()) != empty_arena_template:
             raise ValueError("All procedural maps must use matching arena configuration")
-    # Keep navigation metadata consistent with the configured front-ray
-    # threshold.  The local CBF itself uses the derived footprint clearance.
+    # Navigation metadata uses the front-ray threshold; the CBF uses the
+    # derived footprint clearance.
     safety_arena_template = replace(
         empty_arena_template,
         wall_clearance=float(cfg.safety_clearance),
@@ -457,9 +415,7 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
         cfg.config.navigation,
         arena=safety_arena_template,
     )
-    # Vanilla is the no-CBF reward baseline. Keep the counterfactual filter
-    # diagnostics, but do not reward or penalize the actor for a correction
-    # that is never applied to its command.
+    # Vanilla never applies the filter correction, so it is not penalized.
     training_reward_cfg = replace(
         cfg.config.reward,
         cbf_correction_weight=(
@@ -493,8 +449,7 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
     add_navigation_laser_sensor(env_cfg, method_cfg)
 
     raw_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=None)
-    # MuJoCo-Warp supports these model fields per environment. Expanding them
-    # lets twelve reusable cylinders preserve every saved map's exact radii/heights.
+    # Per-environment geom sizes let the reusable obstacle slots match each map.
     raw_env.sim.expand_model_fields(("geom_size", "geom_rbound", "geom_aabb"))
     low_env = RslRlVecEnvWrapper(raw_env, clip_actions=low_agent_cfg.clip_actions)
     low_policy = load_frozen_low_level_policy(task_id, low_env, cfg.low_level_checkpoint, device)

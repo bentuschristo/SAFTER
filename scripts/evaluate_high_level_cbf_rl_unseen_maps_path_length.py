@@ -1,22 +1,14 @@
-"""Rerun the CBF-RL unseen-maps structured evaluation (same "500 cases = 20/
-seed x 25 seeds" convention, same three maps: slalom, corridor,
-circle_and_square) but ALSO accumulate true traveled path length per
-episode, using extras["position"] (absolute (x, y) after each high-level
-step, from CbfRlNavigationEnv.step()) -- the existing
-evaluate_high_level_cbf_rl_unseen_maps.py only ever saved start/min/final
-straight-line distance-to-goal, never per-step position, so path length
-couldn't be reconstructed after the fact.
+"""CBF-RL unseen-maps structured evaluation with per-episode path length.
 
-Filter mode and all other parameters match the existing filter-ON run at
-logs/evaluation/cbf_rl_unseen_maps/2026-09-18_16-44-15_dual_handcrafted2_seed0_4096envs_1000iters_circlegeom
-exactly, so results should reproduce that run's success/collision/timeout
-rates (same checkpoint, same seeds, same manifest algorithm) while adding
-path_length_m per episode.
+Same scenarios as evaluate_high_level_cbf_rl_unseen_maps.py (20 cases/seed x
+25 seeds on slalom, corridor, circle_and_square), additionally accumulating
+traveled path length and per-step (x, y) from extras["position"] (absolute
+position after each high-level step, from CbfRlNavigationEnv.step()).
 
 Example:
   python scripts/evaluate_high_level_cbf_rl_unseen_maps_path_length.py \\
       Unitree-Go2-Safe-Navigation \\
-      --checkpoint logs/rsl_rl/go2_cbf_rl/2026-09-17_11-54-21_dual_handcrafted2_seed0_4096envs_1000iters/model_999.pt \\
+      --checkpoint logs/rsl_rl/go2_cbf_rl/<run>/model_999.pt \\
       --low-level-checkpoint logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt \\
       --maps slalom,corridor,circle_and_square \\
       --cases-per-seed 20 --num-seeds 25 --seed 1000 \\
@@ -56,11 +48,11 @@ def evaluate_map_with_path_length(
     *, env, policy, manifest: list[dict[str, object]], num_envs: int, print_every: int,
     stochastic_policy: bool = False,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Returns (episode_records, trajectory_rows). trajectory_rows is the
-    full per-step (x, y) path for every case, one row per (case, step), in
-    the same schema scripts/log_cbf_rl_trajectory.py uses for its single
-    example episode ("case_id", "step", "post_x_m", "post_y_m", "outcome"),
-    plus "map_name" -- outcome is "" until the episode's terminal step."""
+    """Returns (episode_records, trajectory_rows).
+
+    trajectory_rows holds one row per (case, step) in the schema of
+    scripts/log_cbf_rl_trajectory.py ("case_id", "step", "post_x_m",
+    "post_y_m", "outcome") plus "map_name"; outcome is "" until the terminal step."""
     records: list[dict[str, object]] = []
     trajectory_rows: list[dict[str, object]] = []
     if not manifest:
@@ -202,11 +194,8 @@ def run(task_id: str, cfg: EvalCbfRlConfig) -> None:
         env = build_map_env(task_id, map_name, cfg, device)
         policy = load_policy(env, task_id, cfg.checkpoint, device)
 
-        # Pool every seed's manifest before evaluating, instead of calling
-        # evaluate_map_with_path_length once per seed -- each call's batching
-        # waits for its single slowest straggler (up to the full episode
-        # timeout), so num_seeds separate small-batch calls pay that fixed
-        # cost num_seeds times instead of once.
+        # Pool all seeds into one manifest so the slowest-episode wait per
+        # batch is paid once rather than num_seeds times.
         pooled_manifest: list[dict[str, object]] = []
         arena = ArenaConfig(obstacles=UNSEEN_MAPS[map_name], max_obstacles=len(UNSEEN_MAPS[map_name]))
         for evaluation_seed in evaluation_seeds:

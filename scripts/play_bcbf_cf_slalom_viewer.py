@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Live MuJoCo-viewer playback of the bCBF-CF policy (safety filter ACTIVE,
-normal deployment -- env.step_safe applies the filtered/safe command, exactly
-as in every real bcbf_cf evaluation this session) on the actual slalom
-(Easy) structured evaluation map.
+"""Live MuJoCo-viewer playback of the bCBF-CF policy with the safety filter
+active (env.step_safe applies the filtered command) on the slalom (Easy)
+structured evaluation map.
 
-Cycles through every SUCCESSFUL (evaluation_seed, case_id) recorded in the
-prior vxm1 bcbf_cf eval run for the chosen map/seed -- each episode ends,
-the viewer immediately teleports to the next successful case's start/goal,
-looping back to the first once the list is exhausted -- so this plays a
-back-to-back demo reel of real recorded successes, not a single case.
+Cycles through every successful (evaluation_seed, case_id) recorded in an
+existing bcbf_cf evaluation run for the chosen map/seed: when an episode ends,
+the viewer moves to the next successful case and loops back at the end.
 
-Reuses build_environment/load_actor from the structured unseen-map eval
-script (same hand-crafted slalom obstacle layout, same [-1, 2] vx / +-1 vy /
-+-1 wz / backup_margin=0.6 / invariant-ellipse terminal-set config as every
-other bcbf_cf evaluation in this session) and DeterministicLaserPolicy from
-the interactive play script, so the viewer sees exactly the same physical
-policy behavior already measured numerically.
+Uses build_environment/load_actor from the structured unseen-map evaluator
+(same obstacle layout, [-1, 2] vx / +-1 vy / +-1 wz limits, backup_margin=0.6
+and invariant-ellipse terminal set as the bcbf_cf evaluations) and
+DeterministicLaserPolicy from the interactive play script.
 """
 from __future__ import annotations
 
@@ -117,7 +112,7 @@ def main() -> None:
     parser.add_argument("--map-name", default="slalom", choices=("slalom", "corridor", "circle_and_square"))
     parser.add_argument("--manifest-root", default=None,
                          help="Existing run root to pull a seed_*/​<map>/scenarios.csv case from. "
-                              "Defaults to the vxm1 3-map eval run used throughout this session.")
+                              "Defaults to the vxm1 3-map eval run.")
     parser.add_argument("--bcbf-eval-root", default=None,
                          help="Existing bcbf_cf eval run root whose all_episodes.csv records which "
                               "cases succeeded. Defaults to the vxm1 bcbf_cf 3-map eval run.")

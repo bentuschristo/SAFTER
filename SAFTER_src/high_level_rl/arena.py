@@ -1,8 +1,3 @@
-# NOTE: this is a DUPLICATE of src/high_level_rl/arena.py, kept in sync manually.
-# It exists here because src/high_level_rl/arena.py is also load-bearing for
-# map-based code (high_level_sac/high_level_bcbf_sac/high_level_cbf_rl) that
-# intentionally stays outside SAFTER_src. See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 import json

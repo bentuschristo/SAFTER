@@ -1,7 +1,3 @@
-# NOTE: this is a DUPLICATE of src/high_level_control/command_interface.py,
-# kept in sync manually -- also load-bearing for map-based code that stays
-# outside SAFTER_src. See SAFTER_src/README.md.
-
 from __future__ import annotations
 
 from typing import Any

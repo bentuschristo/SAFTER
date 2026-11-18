@@ -37,7 +37,7 @@ from statistics import mean, stdev
 from types import SimpleNamespace
 from typing import Any, Iterable, Literal
 
-# Allow running as: python scripts/laser_unseen_eval/evaluate_laser_unseen_maps_four_methods.py
+# Make the repository root importable when run as a script.
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -67,15 +67,9 @@ import src.tasks  # noqa: F401,E402
 
 
 # -----------------------------------------------------------------------------
-# Evaluation maps: low_shift / medium_shift / high_shift.
-#
-# The default map set is exactly these three maps (low-shift, medium-shift,
-# high-shift), loaded from JSON data files under "Maps/Evaluation Maps/".
-#
-# Additional map variants (exploratory/OOD/distribution-shift/dynamic-obstacle
-# designs) live in SAFTER_scripts/laser_unseen_eval/legacy_unseen_maps.py as
-# LEGACY_UNSEEN_MAPS/LEGACY_STRUCTURED_SCENARIO_REGIONS. That module is not
-# imported here; import it directly to use one of those maps.
+# Evaluation maps: low_shift / medium_shift / high_shift, loaded from JSON files
+# under "Maps/Evaluation Maps/". Other map variants live in
+# legacy_unseen_maps.py (not imported here).
 _EVALUATION_MAPS_DIR = ROOT / "Maps" / "Evaluation Maps"
 _EVALUATION_MAP_NAMES = ("low_shift", "medium_shift", "high_shift")
 
@@ -127,18 +121,12 @@ UNSEEN_MAPS, STRUCTURED_SCENARIO_REGIONS = _load_evaluation_maps(_EVALUATION_MAP
 # -----------------------------------------------------------------------------
 # Dynamic (moving) obstacles.
 #
-# The environment is built through this evaluator's safety-validated pipeline,
-# which sets collision.termination_mode explicitly (the "direct_contact" default
-# never creates a contact sensor and would crash or silently mis-detect
-# collisions) and uses max_obstacles equal to the actual obstacle count.
-#
-# Convention: for any map name present in DYNAMIC_OBSTACLE_COUNTS, the LAST
-# N entries of UNSEEN_MAPS[map_name] (N = the registered count) are the
-# dynamic ones; everything before that is static. UNSEEN_MAPS stores each
-# dynamic obstacle's position at t=0 (matching DynamicObstacleSpec.position_at(0.0)),
-# so arena/manifest generation and the one-time compiled-geometry checks
-# (verify_compiled_physical_map/verify_parallel_lidar_geometry) work exactly
-# as they do for fully-static maps.
+# For a map in DYNAMIC_OBSTACLE_COUNTS, the LAST N entries of
+# UNSEEN_MAPS[map_name] are dynamic and the rest static. Each dynamic entry
+# stores its t=0 position (DynamicObstacleSpec.position_at(0.0)), so manifest
+# generation and the compiled-geometry checks work as for static maps.
+# collision.termination_mode is set explicitly: the "direct_contact" default
+# creates no contact sensor and would mis-detect collisions.
 @dataclass
 class DynamicObstacleSpec:
     radius: float
@@ -232,11 +220,8 @@ def _position_on_waypoints(
     return segments[-1][1]
 
 
-# Number of trailing UNSEEN_MAPS[name] obstacles that are dynamic, keyed by
-# map name. A map absent from this dict is treated as fully static. Populated
-# below from len(DYNAMIC_OBSTACLE_SPECS[name]) -- never hardcode these counts
-# here; a mismatch with the actual spec tuple length causes obstacle_centers
-# slice-assignment shape errors at env build time.
+# Number of trailing dynamic obstacles per map (absent = fully static), derived
+# below from DYNAMIC_OBSTACLE_SPECS so it always matches the spec tuple length.
 DYNAMIC_OBSTACLE_COUNTS: dict[str, int] = {}
 
 # The DynamicObstacleSpec for each dynamic obstacle, in the same trailing
@@ -665,13 +650,8 @@ def summarize_episodes(episodes: list[dict[str, object]], **labels: object) -> d
             (float(r["min_residual_exec"]) for r in episodes if math.isfinite(float(r["min_residual_exec"]))),
             default=math.nan,
         )
-    # Pooled-over-all-steps (not per-episode-averaged) clip-vs-barrier
-    # counters: a per-episode average is dominated by episodes with zero
-    # clip events (clipping is rare per-episode). The quantity of interest --
-    # conditional on the final hard clip changing the command, how often the
-    # as-executed command violates the CBF condition -- is computed by pooling
-    # raw step counts across every episode in this group, not by averaging
-    # each episode's own (often undefined) rate.
+    # Clip-vs-barrier counters are pooled over all steps rather than averaged
+    # per episode, since clip events are rare and most episodes have none.
     if episodes and "diag_steps" in episodes[0]:
         total_diag_steps = sum(int(r["diag_steps"]) for r in episodes)
         total_clip_steps = sum(int(r["clip_triggered_steps"]) for r in episodes)
@@ -768,12 +748,9 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def make_map_arena(map_name: str) -> ArenaConfig:
     obstacles = UNSEEN_MAPS[map_name]
-    # max_obstacles must equal the actual obstacle count exactly: the
-    # compiled MuJoCo scene only creates one body per real obstacle, so any
-    # padding slot (max_obstacles > len(obstacles)) has no matching body and
-    # verify_compiled_physical_map() fails looking for it. The 5 original
-    # maps all happen to have exactly 9 obstacles, which is why the old
-    # hardcoded default of 9 never surfaced this.
+    # max_obstacles must equal the actual obstacle count: the compiled scene has
+    # one body per real obstacle, so padding slots fail
+    # verify_compiled_physical_map().
     arena = ArenaConfig(obstacles=obstacles, max_obstacles=len(obstacles))
     arena.validate()
     return arena
@@ -786,15 +763,10 @@ def static_obstacle_count(map_name: str) -> int:
 
 
 def install_physical_map(map_name: str) -> None:
-    # Only the STATIC prefix is compiled into the shared "navigation_arena"
-    # entity via physical_arena_cfg. Dynamic obstacles (the trailing
-    # DYNAMIC_OBSTACLE_COUNTS[map_name] entries) are compiled separately as
-    # individually addressable mocap bodies in build_environment(), matching
-    # the naming convention (obstacle_{index}/obstacle_{index}_collision)
-    # physical_arena_cfg._make_arena_xml() would have used for them, so
-    # verify_compiled_physical_map/verify_parallel_lidar_geometry and the
-    # LiDAR raycasting code find them the same way regardless of which path
-    # compiled them.
+    # Only the static prefix is compiled into the "navigation_arena" entity;
+    # dynamic obstacles become mocap bodies in build_environment() with the same
+    # obstacle_{index}/obstacle_{index}_collision naming, so geometry checks and
+    # LiDAR raycasting find them either way.
     source = UNSEEN_MAPS[map_name][: static_obstacle_count(map_name)]
     physical_arena_cfg.OBSTACLES = tuple(
         physical_arena_cfg.CircularObstacle(
@@ -845,12 +817,8 @@ def add_navigation_laser_sensor(env_cfg, cfg: LaserSacConfig) -> None:
     )
     extra_sensors: tuple = ()
     if contact.termination_mode == "direct_contact":
-        # These two contact sensors add real per-substep MuJoCo/mjWarp
-        # contact-kernel cost and are the only consumers of
-        # step_safe()'s contact-force readout. "circle" mode (the default,
-        # and the only mode used by every local eval/training run so far)
-        # never reads them, so skip creating them entirely in that mode
-        # rather than paying for sensors whose output is always discarded.
+        # These contact sensors add per-substep contact-kernel cost and are only
+        # read by step_safe() outside "circle" mode, so skip them in that mode.
         terminal_contact = ContactSensorCfg(
             name=contact.terminal_sensor_name,
             primary=ContactMatch(
@@ -963,21 +931,14 @@ def make_laser_config(
         **({} if backup_margin is None else {"backup_margin": float(backup_margin)}),
         **({} if integration_dt is None else {"integration_dt": float(integration_dt)}),
         **({} if backup_rollout_substeps is None else {"backup_rollout_substeps": int(backup_rollout_substeps)}),
-        # Deliberate backup-dynamics-model sensitivity override (see
-        # load_actor's allow_control_dynamics_a_mismatch): a value here that
-        # differs from the checkpoint's training-time control_dynamics_a
-        # simulates the safety filter having an INACCURATE assumed
-        # command-tracking decay rate for backup-trajectory prediction, while
-        # the actual simulated system dynamics (and the frozen policy
-        # weights) stay exactly as trained.
+        # Optional backup-dynamics sensitivity override: a control_dynamics_a that
+        # differs from the checkpoint's makes the filter's assumed command-tracking
+        # decay inaccurate while simulation and policy stay as trained (see
+        # load_actor's allow_control_dynamics_a_mismatch).
         **({} if control_dynamics_a is None else {"control_dynamics_a": tuple(float(x) for x in control_dynamics_a)}),
-        # Scales all three LSE sharpness parameters proportionally
-        # (sensitivity study on LSE-aggregation conservativeness): kappa_scale
-        # multiplies the LaserSafetyConfig defaults (kappa_backup=50,
-        # kappa_input=20, kappa_outer=20), not the values the checkpoint was
-        # trained with; checkpoints are trained at kappa_scale=1 (the
-        # defaults), so the two coincide. See load_actor's
-        # allow_kappa_mismatch escape hatch.
+        # kappa_scale multiplies the LaserSafetyConfig LSE defaults (kappa_backup=50,
+        # kappa_input=20, kappa_outer=20); checkpoints are trained at kappa_scale=1.
+        # See load_actor's allow_kappa_mismatch.
         **(
             {}
             if kappa_scale is None
@@ -1295,44 +1256,24 @@ def load_actor(
     saved_safety_raw = checkpoint.get("config", {}).get("safety")
     saved_safety = dict(saved_safety_raw) if isinstance(saved_safety_raw, dict) else saved_safety_raw
     current_safety = asdict(cfg)["safety"]
-    # Solver backend and backward estimator are runtime choices and do not
-    # alter actor weights or QP rows. Training normally uses active_set+STE;
-    # deployment can use exact OSQP without invalidating the checkpoint.
-    # cf_straight_through is the same kind of backward-pass-only choice for
-    # the CF filter (verified: forward output is bit-identical regardless of
-    # its value, only the training-time gradient differs) -- a bcbf_cf
-    # ablation checkpoint trained with it True must still be evaluable here.
+    # Solver backend and backward-pass estimators (qp_straight_through,
+    # cf_straight_through) are runtime choices that change neither actor
+    # weights nor the forward filter output.
     for runtime_key in ("qp_backend", "qp_straight_through", "cf_straight_through"):
         if isinstance(saved_safety, dict):
             saved_safety.pop(runtime_key, None)
         current_safety.pop(runtime_key, None)
-    # Older checkpoints may predate the collision-geometry and QP-solver
-    # fields. Missing new fields are compatible, and every field actually
-    # recorded in the checkpoint must still agree -- except collision_geometry
-    # itself (see the pop below): it is a pure offline analytical-outcome
-    # reclassification choice regardless of a checkpoint's vintage, so a
-    # checkpoint that predates the field (implicitly the 0.30 m circle
-    # definition) is as eligible for reclassification under
-    # --collision-geometry ellipse as one that recorded "circle".
-    # collision_geometry/collision_margin_m are a pure offline analytical
-    # outcome-classification choice (see the "Analytical overlap is retained
-    # strictly as an offline diagnostic" note in sac_navigation_env.py): the
-    # formal safety violation/reward -- and the actor weights themselves --
-    # never depend on it, only the local LiDAR LSE barrier does. They can be
-    # swapped at eval time without invalidating the checkpoint.
+    # Fields missing from a checkpoint are compatible; every recorded field must
+    # agree. collision_geometry/collision_margin_m only affect offline outcome
+    # classification and the local LiDAR LSE barrier, not the actor weights, so
+    # they may be swapped at eval time.
     for diagnostic_key in ("collision_geometry", "collision_margin_m"):
         if isinstance(saved_safety, dict):
             saved_safety.pop(diagnostic_key, None)
         current_safety.pop(diagnostic_key, None)
-    # control_dynamics_a IS normally part of the strict check below: unlike
-    # the runtime/diagnostic keys popped above, it changes the DISTRIBUTION
-    # the policy was trained under (the filter used it to project every
-    # training-time action), so silently tolerating a mismatch would hide a
-    # real train/eval inconsistency. allow_control_dynamics_a_mismatch is an
-    # explicit, opt-in escape hatch for deliberately studying that exact
-    # sensitivity (model-mismatch robustness of the backup-trajectory
-    # prediction) with an already-trained, otherwise-unmodified checkpoint --
-    # never set True for an ordinary evaluation.
+    # control_dynamics_a stays in the strict check because the filter used it to
+    # project every training action. allow_control_dynamics_a_mismatch is an
+    # opt-in escape hatch for model-mismatch sensitivity studies only.
     if allow_control_dynamics_a_mismatch:
         saved_value = saved_safety.get("control_dynamics_a") if isinstance(saved_safety, dict) else None
         current_value = current_safety.get("control_dynamics_a")
@@ -1344,11 +1285,8 @@ def load_actor(
         if isinstance(saved_safety, dict):
             saved_safety.pop("control_dynamics_a", None)
         current_safety.pop("control_dynamics_a", None)
-    # Same escape-hatch pattern as control_dynamics_a, for the LSE-sharpness
-    # sensitivity study (kappa_backup/kappa_input/kappa_outer). Every
-    # existing checkpoint trained at the defaults (50, 20, 20), so this
-    # re-evaluates an unmodified policy under different LSE conservativeness,
-    # not a genuinely different checkpoint config.
+    # Same escape hatch for the LSE-sharpness sensitivity study
+    # (kappa_backup/kappa_input/kappa_outer; checkpoints use 50, 20, 20).
     if allow_kappa_mismatch:
         for kappa_key in ("kappa_backup", "kappa_input", "kappa_outer"):
             saved_value = saved_safety.get(kappa_key) if isinstance(saved_safety, dict) else None
@@ -1412,11 +1350,7 @@ def load_actor(
         saved_value = nested_value(saved_navigation, field_path)
         current_value = nested_value(current_navigation, field_path)
         if field_path == ("action", "min_vx") and saved_value is None:
-            # Checkpoints trained before min_vx existed predate asymmetric
-            # vx bounds entirely -- they were always implicitly symmetric
-            # (min_vx == -max_vx). Compare against that implied value
-            # instead of raising a spurious mismatch on a field that simply
-            # didn't exist yet when they were trained.
+            # Checkpoints without min_vx used symmetric bounds (min_vx == -max_vx).
             saved_max_vx = nested_value(saved_navigation, ("action", "max_vx"))
             saved_value = None if saved_max_vx is None else -saved_max_vx
         if saved_value != current_value:
@@ -1435,15 +1369,10 @@ def load_actor(
     # The local scan-point v2 model changes the safety-layer state and must not
     # silently load an older frozen-ray checkpoint.
     actor_state_dict = dict(checkpoint["actor"])
-    # The actor's action buffers are action_low/action_high/action_center/
-    # action_half_range (an asymmetric-capable affine map -- see
-    # LaserSafeSacActor.min_vx). They are derived purely from the (already
-    # compatibility-checked above) config and never learned. Older checkpoints
-    # carry a single symmetric per-axis action_scale buffer instead, so the new
-    # keys are filled from the freshly constructed actor's own buffers before
-    # loading, and the old key is dropped. strict=True is kept (this is the
-    # only special-cased rename) so any genuine missing/unexpected key --
-    # e.g. an actual learned parameter -- still raises.
+    # Action buffers (action_low/high/center/half_range) are derived from the
+    # config, never learned. Checkpoints with a single symmetric action_scale
+    # buffer get the new keys from the fresh actor and the old key dropped;
+    # strict=True still catches any other missing/unexpected key.
     actor_state_dict.pop("action_scale", None)
     for buffer_name in ("action_low", "action_high", "action_center", "action_half_range"):
         actor_state_dict.setdefault(buffer_name, actor.state_dict()[buffer_name])
@@ -1622,12 +1551,8 @@ def verify_parallel_lidar_geometry(
         & (circle_hit_z <= center_z[:, :, None] + half_height[:, :, None])
     )
 
-    # Axis-aligned-box (square obstacle) ray intersection via the slab method,
-    # since the circle-only quadratic above never matches a real square's
-    # physically-raycast surface. square_mask (per-slot "circle"/"square")
-    # selects which formula each obstacle slot actually uses; the real LiDAR
-    # sensor is a true MuJoCo raycast and is already shape-correct regardless
-    # -- only this analytical cross-check needed updating.
+    # Axis-aligned-box (square obstacle) ray intersection via the slab method;
+    # square_mask selects the formula per obstacle slot.
     if bool(square_mask.any()):
         half = env.obstacle_radii[:, :, None]
         cx = env.obstacle_centers[:, :, None, 0]
@@ -2120,13 +2045,8 @@ def generate_manifest_randomized(
         direct_path_clearance = straight_path_min_clearance(start_point, goal_point)
         yaw_nominal = math.atan2(float(goal_point[1] - start_point[1]), float(goal_point[0] - start_point[0]))
         yaw_unwrapped = yaw_nominal + rng.uniform(-float(yaw_jitter_rad), float(yaw_jitter_rad))
-        # Full-arena start/goal pairs can point in ANY direction, including
-        # close to +/-180 degrees -- unlike generate_manifest()'s narrow,
-        # consistently-oriented boxes, jitter here can push yaw_nominal past
-        # +/-pi. Wrap to the same canonical (-pi, pi] range the environment
-        # itself normalizes yaw to, or env.set_fixed_scenario()'s actual yaw
-        # will not bitwise-match this saved value (see evaluate_method's/
-        # evaluate_method_vectorized's yaw-mismatch sanity check).
+        # Full-arena pairs can face any direction, so wrap yaw to (-pi, pi] as the
+        # environment does; otherwise the yaw-mismatch sanity check fails.
         yaw = math.atan2(math.sin(yaw_unwrapped), math.cos(yaw_unwrapped))
 
         case_id = len(rows)
@@ -2694,30 +2614,20 @@ def evaluate_method_vectorized(
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
     dumped_states: list[dict[str, torch.Tensor]] = []
-    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters:
-    # since clip events are rare per episode, a per-episode average would be
-    # dominated by many NaN/zero-sample episodes. Pooling over every step in
-    # the whole map evaluation gives a clean estimate of: of the steps where
-    # the final hard clip changed the command, what fraction left the
-    # as-executed command violating the CBF condition -- versus that same rate
-    # on steps where clipping was a no-op (the baseline rate, needed to
-    # isolate clip's own contribution).
+    # Pooled clip-vs-barrier counters: among steps where the final hard clip
+    # changed the command, the fraction whose executed command violates the CBF
+    # condition, versus the same rate on steps where clipping was a no-op.
     pooled_diag_steps = 0
     pooled_clip_steps = 0
     pooled_clip_violation_steps = 0
     pooled_no_clip_violation_steps = 0
-    # Of the clip-triggered steps, how many had a pre-clip (certified
-    # surrogate) command that satisfied the CBF residual -- i.e. a genuine
-    # "clipping broke a previously-valid certificate" event, as opposed to a
-    # step that was already infeasible/degenerate before clipping ever
-    # touched it. Cross-tabulated with the existing projection_feasible flag.
+    # Clip-triggered steps whose pre-clip command satisfied the CBF residual
+    # (clipping broke a valid certificate), cross-tabulated with
+    # projection_feasible.
     pooled_clip_feasible_steps = 0
     pooled_clip_feasible_violation_steps = 0
-    # Box-diagonal normalization for "maximum normalized command change":
-    # the hard clip operates on [vx, vy, wz] jointly, so clip_delta is
-    # already a Euclidean norm over mixed units (m/s, m/s, rad/s); dividing
-    # by the admissible box's own diagonal extent gives a dimensionless
-    # fraction of the action range, comparable across configurations.
+    # Normalize clip_delta (Euclidean norm over m/s, m/s, rad/s) by the action
+    # box diagonal to get a dimensionless fraction of the action range.
     effective_min_vx = -float(action_max_vx) if action_min_vx is None else float(action_min_vx)
     box_scale = math.sqrt(
         (float(action_max_vx) - effective_min_vx) ** 2
@@ -3293,18 +3203,10 @@ def main() -> None:
     seed_map_rows: list[dict[str, object]] = []
     seed_aggregate_rows: list[dict[str, object]] = []
 
-    # Manifests for every seed of a map are built up front, then every
-    # not-yet-resumed seed's cases are pooled into one manifest per
-    # (map, method) before evaluating. batch_size inside
-    # evaluate_method_vectorized is min(--num-envs, pooled case count), so a
-    # sufficiently large --num-envs (e.g. --num-envs 500 with --num-seeds 25
-    # --cases-per-seed 20) processes an entire map's cases in a single batch
-    # instead of one batch per seed, avoiding repeated waits for each batch's
-    # slowest episode. The per-seed seed_X/map/method/method_episodes.csv file
-    # layout is unchanged. evaluate_method_vectorized seeds once from the
-    # pooled manifest's first case's reset_seed, which only affects the exact
-    # LiDAR-noise draw sequence, not scenario content or any statistical
-    # property of the results.
+    # All not-yet-resumed seeds of a map are pooled into one manifest per
+    # (map, method), so a large --num-envs evaluates the whole map in one batch.
+    # Per-seed CSV layout is unchanged; seeding from the pooled manifest's first
+    # reset_seed only affects the LiDAR-noise draw sequence.
     map_dirs: dict[tuple[str, int], Path] = {}
     pooled_root = root / "_pooled_batches"
     for map_name in args.maps:

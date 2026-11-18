@@ -1,31 +1,13 @@
-"""Evaluate CBF-RL on handcrafted2's training maps using the SAME
-construction and reset mechanism training itself uses: one environment
-built with the REAL procedural map bank (all 5 maps, full 12-slot obstacle
-padding), pinned per-batch to specific scenario ids via
-env.set_fixed_procedural_scenarios() -- exactly the method
-scripts/evaluate_training_maps_no_filter.py already uses for the SAC-based
-methods.
+"""Evaluate CBF-RL on the handcrafted2 training maps.
 
-This replaces an earlier version of this script that built one environment
-PER MAP with procedural_map_bank=None (only that map's own obstacle count as
-slots, e.g. 7 instead of the trained 12) and pinned cases via
-env.set_fixed_scenarios() with freshly-sampled region-box coordinates. That
-construction reproducibly capped pooled success around ~35-42% regardless of
-checkpoint, collision geometry, episode duration, or reset-function
-correctness (all individually verified and/or fixed during this
-investigation) -- while this construction (real bank + max_obstacles=12 +
-set_fixed_procedural_scenarios) reproduces training's own ~80-85% success
-rate almost exactly, confirmed on all 5 maps individually before this
-rewrite. The obstacle-slot-count/environment-construction mismatch, not any
-of the reset-function bugs found and fixed along the way, was the actual
-root cause of the eval-vs-training gap this whole session.
+Uses the same construction and reset path as training: one environment with
+the real procedural map bank (all 5 maps, 12 obstacle slots), pinned per
+batch to scenario ids via env.set_fixed_procedural_scenarios(), as
+SAFTER_scripts/evaluate_training_maps_no_filter.py does for the SAC methods.
 
-Scenario selection mirrors evaluate_training_maps_no_filter.py's own
-convention exactly: for each of the 5 maps and each of num_seeds evaluation
-seeds, cases_per_seed scenario ids are sampled (without replacement within
-that seed) from the map's own 200 curated scenarios via a seeded RNG, giving
-the same "N cases per seed x M seeds" structured evaluation used throughout
-this project.
+For each map and each of num_seeds evaluation seeds, cases_per_seed scenario
+ids are sampled without replacement from the map's 200 scenarios with a
+seeded RNG ("N cases per seed x M seeds").
 
 Example (500 cases = 20/seed x 25 seeds, all 5 handcrafted2 maps):
 
@@ -52,10 +34,7 @@ from pathlib import Path
 import torch
 import tyro
 
-# SAFTER_src isn't registered by the repo's editable install (only `src` is,
-# via __editable__.unitree_rl_mjlab-*.pth) -- resolvable from a cwd-relative
-# `python -c` snippet but not from `python scripts/foo.py` (script-relative
-# sys.path[0]). Same fix already used elsewhere in this repo for ad-hoc dirs.
+# SAFTER_src is not part of the editable install, so add the repo root to sys.path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -70,16 +49,13 @@ from src.high_level_cbf_rl.cbf_rl_navigation_env import CbfRlNavigationEnv
 from src.high_level_cbf_rl.config import CbfRlConfig, CbfRlModeConfig
 from src.high_level_control.command_interface import MjlabVelocityCommandInterface
 try:
-    # Local repo state: high_level_laser_sac lives under SAFTER_src/ (moved
-    # there for the paper's supplementary code package).
     from SAFTER_src.high_level_laser_sac.procedural_maps import (
         ProceduralMapBank,
         load_procedural_map_bank,
         resolve_slot_shapes,
     )
 except ModuleNotFoundError:
-    # Server state: SAFTER_src/ hasn't been synced there -- fall back to the
-    # original location.
+    # Fallback for layouts without SAFTER_src/.
     from src.high_level_laser_sac.procedural_maps import (
         ProceduralMapBank,
         load_procedural_map_bank,
@@ -126,10 +102,8 @@ class EvalTrainingMapsConfig:
 def build_bank_env(
     task_id: str, bank: ProceduralMapBank, cfg: EvalTrainingMapsConfig, device: str
 ) -> CbfRlNavigationEnv:
-    """Builds ONE environment with the real procedural map bank (all 5 maps,
-    the bank's own full max_obstacles slot count) -- matching
-    train_high_level_cbf_rl.py's own construction exactly, so scenario
-    selection and obstacle-slot padding are identical to training."""
+    """Build one environment with the full procedural map bank and its
+    max_obstacles slot count, constructed as in train_high_level_cbf_rl.py."""
     slot_shapes = resolve_slot_shapes(bank.maps, bank.max_obstacles)
     entity_names = tuple(f"procedural_obstacle_slot_{slot:02d}" for slot in range(bank.max_obstacles))
 
@@ -166,13 +140,8 @@ def build_bank_env(
     env_cfg = load_env_cfg(task_id, play=not cfg.training_low_level)
     env_cfg.seed = cfg.seed
     low_agent_cfg = load_rl_cfg(task_id)
-    # Not capped to cases_per_seed (a leftover from the old per-seed-manifest
-    # design, where one batch == one seed's cases): the eval loop below
-    # already chunks the full per-map manifest (all seeds pooled) into
-    # batches of min(num_envs, len(manifest)), so a bigger env here means
-    # fewer, larger batches -- each batch pays its "wait for the single
-    # slowest straggler" cost once, so more/smaller batches multiply that
-    # fixed cost for no benefit.
+    # Not capped to cases_per_seed: all seeds of a map are pooled, so more envs
+    # means fewer batches, each waiting once for its slowest episode.
     env_cfg.scene.num_envs = int(cfg.num_envs)
     env_cfg.terminations = {}
     if "push_robot" in env_cfg.events:
@@ -197,9 +166,8 @@ def build_bank_env(
 
 
 def build_manifest(bank: ProceduralMapBank, evaluation_seeds: list[int], cases_per_seed: int) -> list[dict[str, object]]:
-    """Mirrors evaluate_training_maps_no_filter.py::build_manifest exactly:
-    for each map and each seed, sample cases_per_seed scenario ids (without
-    replacement within that seed) from the map's own 200 scenarios."""
+    """Per map and seed, sample cases_per_seed scenario ids without replacement
+    (same scheme as evaluate_training_maps_no_filter.py::build_manifest)."""
     manifest: list[dict[str, object]] = []
     for map_item in bank.maps:
         scenarios_by_id = {s.scenario_id: s for s in map_item.scenarios}
@@ -226,9 +194,8 @@ def evaluate_procedural_scenarios_with_path_length(
     *, env: CbfRlNavigationEnv, policy, manifest: list[dict[str, object]], num_envs: int, print_every: int,
     stochastic_policy: bool = False,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Same convention as evaluate_map_with_path_length, but pins cases via
-    env.set_fixed_procedural_scenarios(scenario_ids) (the correct,
-    training-matching reset path) instead of env.set_fixed_scenarios(...)."""
+    """Like evaluate_map_with_path_length, but pins cases with
+    env.set_fixed_procedural_scenarios(), the training reset path."""
     records: list[dict[str, object]] = []
     trajectory_rows: list[dict[str, object]] = []
     if not manifest:

@@ -2,11 +2,9 @@
 """Top-down MuJoCo screenshot of an evaluation/training map, with the
 initial (start) and goal regions overlaid as translucent rectangles.
 
-Builds a bare ManagerBasedRlEnv (no low-level policy, no RL wrapper --
-we only need one physics reset to get the arena/obstacles/robot in their
-initial spawn state) with render_mode="rgb_array" and a straight-down
-ViewerConfig camera, then composites the start/goal region rectangles in
-pixel space afterward using PIL.
+Builds a bare ManagerBasedRlEnv (one physics reset, no policy or RL wrapper)
+with render_mode="rgb_array" and a straight-down camera, then draws the
+start/goal region rectangles in pixel space with PIL.
 
 Usage:
     python -u scripts/capture_map_topdown.py --map corridor
@@ -46,23 +44,19 @@ from src.high_level_rl.config import ArenaConfig  # noqa: E402
 from src.high_level_cbf_rl.config import CbfRlConfig  # noqa: E402
 
 TASK_ID = "Unitree-Go2-Safe-Navigation"
-ARENA_HALF = 7.5  # matches width=length=15.0 used throughout this project
+ARENA_HALF = 7.5  # 15 m x 15 m arena
 
-# Camera params below (distance=20, fovy=45, straight-down, world-origin
-# lookat) determine the visible half-span in world meters: half_span =
-# distance * tan(fovy/2). Kept as constants here so the pixel<->world
-# mapping used for the region overlay always matches the render call.
+# Straight-down camera at the world origin; visible half-span in meters is
+# distance * tan(fovy/2), shared by the render call and the pixel<->world mapping.
 CAM_DISTANCE = 20.0
 CAM_FOVY_DEG = 45.0
 START_COLOR = (102, 255, 102, 110)  # light green, translucent -- contrasts with the blue MuJoCo floor
 GOAL_COLOR = (255, 214, 10, 110)   # yellow, translucent
 
 def handcrafted2_regions(map_id: int) -> dict[str, tuple[float, float, float, float]]:
-    """Per-map fixed start/goal regions used to generate this map's 200
-    scenarios -- authoritative source: generated/procedural_maps/handcrafted2/
-    generation_config.json's per_map_endpoint_regions (NOT arbitrary
-    whole-arena sampling; each of the 5 maps has its own fixed corner/edge
-    pair, e.g. map_id=0 is bottom-right start -> top-left goal)."""
+    """Fixed start/goal regions of one handcrafted2 map, read from
+    generation_config.json's per_map_endpoint_regions (e.g. map_id=0 is
+    bottom-right start -> top-left goal)."""
     import json
     cfg = json.loads(Path("generated/procedural_maps/handcrafted2/generation_config.json").read_text())
     region = cfg["per_map_endpoint_regions"][str(map_id)]
@@ -77,8 +71,7 @@ def world_half_span() -> float:
 
 
 def world_to_pixel(x: float, y: float, image_size: int) -> tuple[float, float]:
-    """world +x -> image right, world +y -> image up (verified empirically
-    against corridor's known asymmetric obstacle row)."""
+    """world +x -> image right, world +y -> image up."""
     half_span = world_half_span()
     px = (x + half_span) / (2 * half_span) * image_size
     py = (half_span - y) / (2 * half_span) * image_size

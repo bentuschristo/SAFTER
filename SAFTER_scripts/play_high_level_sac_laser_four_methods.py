@@ -225,10 +225,8 @@ def run(task_id: str, cfg: PlayLaserSacConfig) -> None:
     checkpoint_path = Path(cfg.high_level_checkpoint).expanduser()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     check_checkpoint_compatibility(checkpoint, method_cfg, checkpoint_path)
-    # action_scale (old symmetric-only buffer) was replaced by
-    # action_low/action_high/action_center/action_half_range; both are
-    # derived purely from config, never learned, so a legacy checkpoint's
-    # saved value is dropped rather than loaded.
+    # Action-bound buffers are derived from config, not learned; drop any
+    # saved copy.
     actor_state_dict = dict(checkpoint["actor"])
     actor_state_dict.pop("action_scale", None)
     for buffer_name in ("action_low", "action_high", "action_center", "action_half_range"):
