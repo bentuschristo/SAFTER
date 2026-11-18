@@ -46,8 +46,14 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 from src.high_level_cbf_rl.cbf_rl_navigation_env import CbfRlNavigationEnv
-from src.high_level_cbf_rl.config import CbfRlConfig, CbfRlModeConfig
+from src.high_level_cbf_rl.config import (
+    CbfRlConfig,
+    CbfRlModeConfig,
+    CbfRlRewardProfile,
+    resolve_checkpoint_config,
+)
 from src.high_level_control.command_interface import MjlabVelocityCommandInterface
+from SAFTER_src.high_level_laser_sac.config import CollisionTerminationMode
 try:
     from SAFTER_src.high_level_laser_sac.procedural_maps import (
         ProceduralMapBank,
@@ -96,6 +102,11 @@ class EvalTrainingMapsConfig:
     enable_lidar_noise: bool = True
     output_dir: str = "logs/evaluation/cbf_rl_training_maps"
     run_name: str = ""
+    # None: use the rate/profile saved in the checkpoint's params/cbf_rl.yaml.
+    high_level_hz: float | None = None
+    reward_profile: CbfRlRewardProfile | None = None
+    # Evaluation termination, as in the SAC evaluators.
+    collision_termination_mode: CollisionTerminationMode = "circle"
     config: CbfRlConfig = field(default_factory=CbfRlConfig)
 
 
@@ -107,7 +118,8 @@ def build_bank_env(
     slot_shapes = resolve_slot_shapes(bank.maps, bank.max_obstacles)
     entity_names = tuple(f"procedural_obstacle_slot_{slot:02d}" for slot in range(bank.max_obstacles))
 
-    navigation_cfg = cfg.config.navigation
+    base_cfg = resolve_checkpoint_config(cfg.config, cfg.checkpoint, cfg.high_level_hz, cfg.reward_profile)
+    navigation_cfg = base_cfg.navigation
     bank_arena = bank.maps[0].arena
     if any(
         (item.arena.width, item.arena.length, item.arena.wall_thickness, item.arena.wall_height)
@@ -124,15 +136,18 @@ def build_bank_env(
         navigation_cfg = replace(navigation_cfg, episode_duration_s=cfg.episode_duration_s)
 
     laser_cfg = replace(
-        cfg.config.laser,
+        base_cfg.laser,
         num_rays=int(cfg.laser_num_rays),
         fov_deg=float(cfg.laser_fov_deg),
         enable_lidar_noise=bool(cfg.enable_lidar_noise),
     )
     method_cfg = replace(
-        cfg.config,
+        base_cfg,
         navigation=navigation_cfg,
         laser=laser_cfg,
+        contact_collision=replace(
+            base_cfg.contact_collision, termination_mode=cfg.collision_termination_mode
+        ),
         mode=CbfRlModeConfig(use_cbf_action_filtering=cfg.use_cbf_action_filtering, use_cbf_reward_penalty=False),
     )
 

@@ -1,19 +1,15 @@
 """Evaluate a CBF-RL PPO checkpoint on fixed unseen-map layouts.
 
-Mirrors scripts/laser_unseen_eval/evaluate_laser_unseen_maps_structured.py's
-"N cases per seed x M seeds" structured-scenario evaluation convention
-(same UNSEEN_MAPS obstacle layouts and STRUCTURED_SCENARIO_REGIONS
-start/goal boxes, same rejection-sampling manifest algorithm), but drives a
-plain rsl_rl/PPO CbfRlNavigationEnv checkpoint -- a deterministic policy
-call plus a single env.step(action) -- instead of the SAC pipeline's
-differentiable actor + step_safe(nominal, safe, safety) interface.
+Uses the same "N cases per seed x M seeds" structured scenarios as
+SAFTER_scripts/laser_unseen_eval/evaluate_laser_unseen_maps_structured.py
+(same obstacle layouts, start/goal regions and manifest sampling), driving a
+PPO CbfRlNavigationEnv policy with a deterministic action per env.step().
 
-Example (matches the SAC baselines' "500 cases, 25 seeds" convention:
-cases_per_seed=20 x num_seeds=25 = 500):
+Example (500 cases = 20 cases per seed x 25 seeds):
 
   python scripts/evaluate_high_level_cbf_rl_unseen_maps.py \\
       Unitree-Go2-Safe-Navigation \\
-      --checkpoint logs/rsl_rl/go2_cbf_rl/2026-09-14_16-51-50_dual_handcrafted2_seed0/model_1666.pt \\
+      --checkpoint logs/rsl_rl/go2_cbf_rl/<run>/model_<iter>.pt \\
       --low-level-checkpoint logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt \\
       --maps slalom corridor clustered_v2 circle_and_square \\
       --cases-per-seed 20 --num-seeds 25 --seed 1000 \\
@@ -41,19 +37,22 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 from src.high_level_cbf_rl.cbf_rl_navigation_env import CbfRlNavigationEnv
-from src.high_level_cbf_rl.config import CbfRlConfig, CbfRlModeConfig
+from src.high_level_cbf_rl.config import (
+    CbfRlConfig,
+    CbfRlModeConfig,
+    CbfRlRewardProfile,
+    resolve_checkpoint_config,
+)
 from src.high_level_control.command_interface import MjlabVelocityCommandInterface
+from SAFTER_src.high_level_laser_sac.config import CollisionTerminationMode
 from src.high_level_rl.config import ArenaConfig, CircularObstacle
 from src.high_level_rl.low_level import load_frozen_low_level_policy
 
 from train_high_level_cbf_rl import add_navigation_laser_sensor, make_walls_only_arena_cfg
 
-# --- The unseen-map obstacle layouts + structured start/goal regions, copied
-# verbatim from scripts/laser_unseen_eval/evaluate_laser_unseen_maps_structured.py
-# (UNSEEN_MAPS / STRUCTURED_SCENARIO_REGIONS) so this evaluates the exact
-# same scenarios the SAC baselines were scored on. Duplicated rather than
-# imported since scripts/ isn't a package and that file is a large,
-# SAC-actor-specific evaluator not meant to be imported from.
+# Unseen-map obstacle layouts and structured start/goal regions, identical to
+# SAFTER_scripts/laser_unseen_eval/evaluate_laser_unseen_maps_structured.py so
+# CBF-RL is scored on the same scenarios as the SAC methods.
 
 UNSEEN_MAPS: dict[str, tuple[CircularObstacle, ...]] = {
     "corridor": (
@@ -67,10 +66,8 @@ UNSEEN_MAPS: dict[str, tuple[CircularObstacle, ...]] = {
         CircularObstacle(1.9, 2.2, 0.50),
         CircularObstacle(3.8, 2.2, 0.50),
     ),
-    # Corridor-derived High-Shift v5. Upper row preserves the v4 larger
-    # circles and 0.70 m gates. The lower row forms a symmetric V: outer
-    # circles are raised farther than inner circles, with 0.80 m Euclidean
-    # edge-to-edge gaps between every adjacent lower-row obstacle.
+    # Corridor-derived High-Shift layout: upper row of larger circles with
+    # 0.70 m gates; lower row forms a symmetric V with 0.80 m edge-to-edge gaps.
     "corridor_derived_highshift_v5": (
         CircularObstacle(-4.00,  2.2, 0.65),
         CircularObstacle(-2.00,  2.2, 0.65),
@@ -82,11 +79,7 @@ UNSEEN_MAPS: dict[str, tuple[CircularObstacle, ...]] = {
         CircularObstacle( 2.35, -1.3, 0.65),
         CircularObstacle( 4.08, -0.4, 0.50),
     ),
-    # "Eased" circle_and_square (2026-09-24): center circle radius reduced
-    # 1.00 -> 0.70, and the two small goal-side squares at (+-1.0, -2.6,
-    # r=0.40) removed entirely -- matches SAFTER_scripts/laser_unseen_eval/
-    # evaluate_laser_unseen_maps_structured.py's own updated layout exactly,
-    # now used as the "High-Shift" tier in place of the diagonal map.
+    # High-Shift tier: mixed circle and square obstacles.
     "circle_and_square": (
         CircularObstacle(-1.6, 3.4, 0.35, shape="circle"),
         CircularObstacle(1.6, 3.4, 0.35, shape="circle"),
@@ -120,12 +113,8 @@ UNSEEN_MAPS: dict[str, tuple[CircularObstacle, ...]] = {
         CircularObstacle(3.9, 2.1, 0.50),
         CircularObstacle(5.2, -2.3, 0.50),
     ),
-    # diagonal (2026-09-23, v4): copied verbatim from
-    # evaluate_laser_unseen_maps_structured.py's UNSEEN_MAPS["diagonal"] --
-    # see that file's comment and scripts/plot_diagonal_shift_map_preview.py
-    # for the full design writeup (bottom-left -> top-right traversal,
-    # point-symmetric ring of large circles around a dead-center r=1.0
-    # blocker, one symmetric 0.88 m tight gate).
+    # Bottom-left -> top-right traversal: point-symmetric ring of large circles
+    # around a central r=1.0 blocker, with one 0.88 m gate.
     "diagonal": (
         CircularObstacle(0.0, 0.0, 1.00, shape="circle"),
         CircularObstacle(-4.5, -0.75, 0.65, shape="circle"),
@@ -194,9 +183,8 @@ def generate_manifest(
     max_sampling_attempts: int = 10000,
     yaw_jitter_rad: float = 0.25,
 ) -> list[dict[str, object]]:
-    """Structured start/goal cases for one map -- ported verbatim (algorithm
-    unchanged) from evaluate_laser_unseen_maps_structured.py::generate_manifest,
-    minus its CSV-writing side effect."""
+    """Structured start/goal cases for one map, using the same sampling
+    algorithm as the structured SAC evaluator's generate_manifest."""
     regions = STRUCTURED_SCENARIO_REGIONS[map_name]
     start_box = clip_box_to_arena(regions["start"], arena)
     goal_box = clip_box_to_arena(regions["goal"], arena)
@@ -278,9 +266,7 @@ def generate_manifest(
 
 
 def make_fixed_map_obstacle_entities(obstacles: tuple[CircularObstacle, ...]) -> dict[str, EntityCfg]:
-    """One static body per obstacle, placed once (no per-episode movement
-    needed -- unlike training's reusable procedural mocap slots, an eval run
-    only ever uses one fixed map)."""
+    """One static body per obstacle; an evaluation run uses a single fixed map."""
     entities: dict[str, EntityCfg] = {}
     for index, obstacle in enumerate(obstacles):
         half_height = 0.5 * float(obstacle.height)
@@ -312,21 +298,15 @@ def make_fixed_map_obstacle_entities(obstacles: tuple[CircularObstacle, ...]) ->
 class EvalCbfRlConfig:
     checkpoint: str
     low_level_checkpoint: str
-    # Comma-separated because the task launcher performs two-stage CLI
-    # parsing (tyro.cli for the task id, then tyro.cli(EvalCbfRlConfig,
-    # args=remaining)); a variable-length tuple loses all but its first
-    # value across that boundary -- same reason
-    # train_SAC_policies.py's --hidden-dims is a
-    # comma-separated string instead of a tuple field.
+    # Comma-separated: the launcher's two-stage CLI parsing keeps only the
+    # first value of a variable-length tuple.
     maps: str = "slalom,corridor,clustered_v2,circle_and_square"
     cases_per_seed: int = 20
     num_seeds: int = 25
     seed_stride: int = 1
     seed: int = 1000
     num_envs: int = 50
-    # None inherits the navigation config (90 s, matching what training
-    # actually used) -- the old 60.0 default here never matched training and
-    # inflated the apparent timeout rate.
+    # None uses the navigation config's episode length (90 s, as in training).
     episode_duration_s: float | None = None
     device: str | None = None
     use_cbf_action_filtering: bool = True
@@ -335,56 +315,55 @@ class EvalCbfRlConfig:
     enable_lidar_noise: bool = True
     output_dir: str = "logs/evaluation/cbf_rl_unseen_maps"
     run_name: str = ""
+    # manifest_seed = evaluation_seed + 10000 * (map_index_offset + position in
+    # --maps); the offset lets single-map runs reproduce the cases of a
+    # multi-map run (and of the structured SAC evaluator).
+    map_index_offset: int = 0
+    # None: use the rate/profile saved in the checkpoint's params/cbf_rl.yaml.
+    high_level_hz: float | None = None
+    reward_profile: CbfRlRewardProfile | None = None
+    # Evaluation termination, as in the SAC evaluators.
+    collision_termination_mode: CollisionTerminationMode = "circle"
     config: CbfRlConfig = field(default_factory=CbfRlConfig)
 
 
 def build_map_env(task_id: str, map_name: str, cfg: EvalCbfRlConfig, device: str) -> CbfRlNavigationEnv:
     obstacles = UNSEEN_MAPS[map_name]
+    base_cfg = resolve_checkpoint_config(cfg.config, cfg.checkpoint, cfg.high_level_hz, cfg.reward_profile)
     arena = ArenaConfig(obstacles=obstacles, max_obstacles=len(obstacles))
-    navigation_cfg = replace(cfg.config.navigation, arena=arena)
+    navigation_cfg = replace(base_cfg.navigation, arena=arena)
     if cfg.episode_duration_s is not None:
         navigation_cfg = replace(navigation_cfg, episode_duration_s=cfg.episode_duration_s)
     laser_cfg = replace(
-        cfg.config.laser,
+        base_cfg.laser,
         num_rays=int(cfg.laser_num_rays),
         fov_deg=float(cfg.laser_fov_deg),
         enable_lidar_noise=bool(cfg.enable_lidar_noise),
     )
-    # circle_and_square has square slots -- CbfRlNavigationEnv requires
-    # collision_geometry="circle" whenever any slot is square, so use it
-    # uniformly across all maps for a consistent, comparable eval
-    # (matches the SAC baselines' own --collision-geometry circle convention
-    # for this exact map set, see run_slalom_corridor_clustered_v2_*.sh).
-    safety_cfg = replace(cfg.config.safety, collision_geometry="circle", collision_circle_radius_m=0.30)
+    # Circle collision geometry is required when any obstacle is square, so it
+    # is used for every map (as in the SAC evaluations).
+    safety_cfg = replace(base_cfg.safety, collision_geometry="circle", collision_circle_radius_m=0.30)
     method_cfg = replace(
-        cfg.config,
+        base_cfg,
         navigation=navigation_cfg,
         laser=laser_cfg,
         safety=safety_cfg,
+        contact_collision=replace(
+            base_cfg.contact_collision, termination_mode=cfg.collision_termination_mode
+        ),
         mode=CbfRlModeConfig(use_cbf_action_filtering=cfg.use_cbf_action_filtering, use_cbf_reward_penalty=False),
     )
 
     env_cfg = load_env_cfg(task_id, play=True)
     low_agent_cfg = load_rl_cfg(task_id)
-    # Not capped to cases_per_seed: run() now pools every seed's manifest for
-    # a map into one list before calling evaluate_map, so a bigger env here
-    # means fewer, larger batches -- each batch pays its "wait for the
-    # single slowest straggler" cost once, so more/smaller batches multiply
-    # that fixed cost for no benefit (matches the same fix applied to
-    # evaluate_high_level_cbf_rl_training_maps.py's build_bank_env).
+    # Not capped to cases_per_seed: all seeds of a map are pooled, so more envs
+    # means fewer batches, each waiting once for its slowest episode.
     env_cfg.scene.num_envs = int(cfg.num_envs)
     env_cfg.terminations = {}
     if "push_robot" in env_cfg.events:
         del env_cfg.events["push_robot"]
-    # unitree_go2_safe_navigation_env_cfg() bakes the *default* 9-obstacle
-    # arena (src/tasks/velocity/config/go2/obstacle_cfg.py's module-level
-    # OBSTACLES) into "navigation_arena" unconditionally. Left alone, that
-    # default set stays physically present -- LiDAR-visible and collidable
-    # -- on top of the UNSEEN_MAPS obstacles added below, giving the robot
-    # two overlapping, conflicting obstacle layouts (the analytical
-    # obstacle_centers/collision bookkeeping only ever knows about the
-    # UNSEEN_MAPS set). Replace it with a walls-only arena matching this
-    # map's own wall geometry before adding this map's actual obstacles.
+    # The task config bakes the default obstacle set into "navigation_arena";
+    # swap in a walls-only arena so only this map's obstacles exist.
     env_cfg.scene.entities["navigation_arena"] = make_walls_only_arena_cfg(arena)
     env_cfg.scene.entities.update(make_fixed_map_obstacle_entities(obstacles))
     add_navigation_laser_sensor(env_cfg, method_cfg)
@@ -434,11 +413,8 @@ def evaluate_map(
         finished = [False] * active_count
         returns = [0.0] * active_count
         steps = [0] * active_count
-        # goal_b (body-frame, normalized goal offset) is the first 2 columns
-        # of the actor observation for every LaserSacNavigationEnv subclass
-        # (config.py: "goal_b(2), measured command(3), ..."). Recovering the
-        # absolute distance from it needs no env changes -- just undo the
-        # normalize_positions_by scaling already applied when it was built.
+        # The first 2 actor-observation columns are the normalized body-frame
+        # goal offset; undo the normalization to get the distance to goal.
         normalize_by = float(env.navigation_cfg.normalize_positions_by)
 
         def distance_to_goal(obs_tensordict) -> torch.Tensor:
@@ -449,9 +425,7 @@ def evaluate_map(
         min_distance = start_distance.clone()
         with torch.no_grad():
             while not all(finished):
-                # get_inference_policy()'s returned callable indexes obs by
-                # obs_groups (obs["actor"]/obs["critic"]) itself -- pass the
-                # full TensorDict, not env.actor_tensor(obs)'s flat tensor.
+                # The inference policy selects obs groups itself; pass the full TensorDict.
                 action = policy(obs, stochastic_output=True) if stochastic_policy else policy(obs)
                 obs, reward, done, extras = env.step(action)
                 # Returned obs already contains the next episode for done envs.
@@ -469,6 +443,10 @@ def evaluate_map(
                         continue
                     success = bool(extras["completed_success"][env_id])
                     collision = bool(extras["completed_collision"][env_id])
+                    # completed_collision covers obstacles and walls; completed_outside
+                    # is the wall/boundary subset.
+                    wall_collision = bool(extras["completed_outside"][env_id])
+                    obstacle_collision = collision and not wall_collision
                     timeout = bool(extras["completed_timeouts"][env_id])
                     fallen = bool(extras["completed_fallen"][env_id])
                     outcome = (
@@ -484,6 +462,8 @@ def evaluate_map(
                         "reset_seed": case["reset_seed"],
                         "success": int(success),
                         "collision": int(collision),
+                        "obstacle_collision": int(obstacle_collision),
+                        "wall_collision": int(wall_collision),
                         "timeout": int(timeout),
                         "fallen": int(fallen),
                         "outcome": outcome,
@@ -507,6 +487,8 @@ def summarize(records: list[dict[str, object]], map_name: str) -> dict[str, obje
         "cases": n,
         "success_rate": sum(r["success"] for r in records) / n if n else math.nan,
         "collision_rate": sum(r["collision"] for r in records) / n if n else math.nan,
+        "obstacle_collision_rate": sum(r["obstacle_collision"] for r in records) / n if n else math.nan,
+        "wall_collision_rate": sum(r["wall_collision"] for r in records) / n if n else math.nan,
         "timeout_rate": sum(r["timeout"] for r in records) / n if n else math.nan,
         "fall_rate": sum(r["fallen"] for r in records) / n if n else math.nan,
         "mean_return": sum(r["return"] for r in records) / n if n else math.nan,
@@ -528,16 +510,12 @@ def run(task_id: str, cfg: EvalCbfRlConfig) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows: list[dict[str, object]] = []
-    for map_index, map_name in enumerate(requested_maps):
+    for map_index, map_name in enumerate(requested_maps, start=cfg.map_index_offset):
         print(f"\n[EVAL] Building env for map={map_name!r}")
         env = build_map_env(task_id, map_name, cfg, device)
         policy = load_policy(env, task_id, cfg.checkpoint, device)
 
-        # Pool every seed's manifest before evaluating, instead of calling
-        # evaluate_map once per seed -- each call's batching waits for its
-        # single slowest straggler (up to the full episode timeout), so
-        # num_seeds separate small-batch calls pay that fixed cost
-        # num_seeds times instead of once.
+        # Pool all seeds so batching waits for the slowest episode once, not per seed.
         pooled_manifest: list[dict[str, object]] = []
         arena = ArenaConfig(obstacles=UNSEEN_MAPS[map_name], max_obstacles=len(UNSEEN_MAPS[map_name]))
         for evaluation_seed in evaluation_seeds:

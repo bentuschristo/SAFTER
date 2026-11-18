@@ -5,8 +5,14 @@ in Training with Control Barrier Functions", using this repo's elliptical
 LiDAR CBF (src.high_level_rl.laser_cbf_filters) with the same footprint and
 margin fields as the laser SAC pipeline, trained with rsl_rl PPO.
 
-Collision termination is purely geometric (ellipse-vs-obstacle Minkowski
-overlap, as in the paper), so only the LiDAR raycast sensor is needed.
+Collision termination follows the SAC training environment:
+--collision-termination-mode direct_contact (default, MuJoCo body-contact
+forces) or circle (geometric footprint overlap).
+
+Reward profiles:
+  --reward-profile original            : Yang et al. reward, 50 Hz by default
+  --reward-profile new_reward_profile  : laser-SAC navigation reward plus the
+                                         scaled CBF terms, 10 Hz by default
 
 Ablation modes (Yang et al. Table III / cbf-rl-demo's four shell scripts):
   --use-cbf-action-filtering --use-cbf-reward-penalty     : Dual (the paper's proposed method)
@@ -39,15 +45,23 @@ import mjlab
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-from mjlab.sensor import ObjRef, RayCastSensorCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 from mjlab.utils.os import dump_yaml
 from mjlab.utils.torch import configure_torch_backends
 
 from src.high_level_cbf_rl.cbf_rl_navigation_env import CbfRlNavigationEnv
-from src.high_level_cbf_rl.config import CbfRlConfig, CbfRlModeConfig
+from src.high_level_cbf_rl.config import (
+    CBF_RL_HIGH_LEVEL_DT,
+    CbfRlConfig,
+    CbfRlModeConfig,
+    CbfRlRewardProfile,
+    default_high_level_hz,
+    with_high_level_rate,
+    with_reward_profile,
+)
 from src.high_level_control.command_interface import MjlabVelocityCommandInterface
 try:
+    from SAFTER_src.high_level_laser_sac.config import CollisionTerminationMode
     from SAFTER_src.high_level_laser_sac.procedural_maps import (
         CURRICULUM_WEIGHTS,
         ProceduralMapBank,
@@ -56,6 +70,7 @@ try:
     )
 except ModuleNotFoundError:
     # Fallback for layouts without SAFTER_src/.
+    from src.high_level_laser_sac.config import CollisionTerminationMode
     from src.high_level_laser_sac.procedural_maps import (
         CURRICULUM_WEIGHTS,
         ProceduralMapBank,
@@ -63,7 +78,7 @@ except ModuleNotFoundError:
         resolve_slot_shapes,
     )
 from src.high_level_rl.low_level import load_frozen_low_level_policy
-from src.high_level_rl.raycast_patterns import HorizontalRingPatternCfg
+from SAFTER_scripts.train_SAC_policies import add_navigation_laser_sensor
 
 
 def make_walls_only_arena_cfg(arena) -> EntityCfg:
@@ -128,38 +143,6 @@ def make_procedural_obstacle_slot_entity(slot: int, obstacle_shape: str = "circl
     )
 
 
-def add_navigation_laser_sensor(env_cfg, cfg: CbfRlConfig) -> None:
-    laser = cfg.laser
-    existing = tuple(
-        sensor for sensor in (env_cfg.scene.sensors or ())
-        if sensor.name != laser.sensor_name
-    )
-    navigation_laser = RayCastSensorCfg(
-        name=laser.sensor_name,
-        frame=ObjRef(type="site", name=laser.lidar_site_name, entity="robot"),
-        ray_alignment="yaw",
-        pattern=HorizontalRingPatternCfg(
-            num_rays=laser.num_rays,
-            fov_deg=laser.fov_deg,
-            origin_x=0.0,
-            origin_y=0.0,
-            origin_z=0.0,
-            yaw_offset_deg=laser.yaw_offset_deg,
-            left_to_right=laser.left_to_right,
-        ),
-        max_distance=laser.max_range,
-        exclude_parent_body=True,
-        include_geom_groups=(0,),
-        debug_vis=laser.debug_vis,
-        viz=RayCastSensorCfg.VizCfg(
-            show_rays=laser.debug_vis,
-            show_normals=False,
-            hit_sphere_radius=0.08,
-        ),
-    )
-    env_cfg.scene.sensors = existing + (navigation_laser,)
-
-
 @dataclass
 class TrainCbfRlConfig:
     low_level_checkpoint: str
@@ -173,6 +156,14 @@ class TrainCbfRlConfig:
     resume_checkpoint: str | None = None
     use_cbf_action_filtering: bool = True
     use_cbf_reward_penalty: bool = True
+    # "original": Yang et al. reward. "new_reward_profile": laser-SAC
+    # navigation reward (plus the CBF-RL terms when use_cbf_reward_penalty).
+    reward_profile: CbfRlRewardProfile = "original"
+    # Policy/LiDAR/filter rate. None: 50 Hz for original, 10 Hz (laser-SAC
+    # rate, 5 low-level steps per command) for new_reward_profile.
+    high_level_hz: float | None = None
+    # Training termination, as in train_SAC_policies.py.
+    collision_termination_mode: CollisionTerminationMode = "direct_contact"
     # LiDAR overrides with the same names as train_SAC_policies.py's CLI.
     laser_num_rays: int = 61
     laser_fov_deg: float = 180.0
@@ -194,6 +185,12 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
     device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    high_level_hz = cfg.high_level_hz or default_high_level_hz(cfg.reward_profile)
+    cfg = replace(
+        cfg,
+        config=with_high_level_rate(with_reward_profile(cfg.config, cfg.reward_profile), high_level_hz),
+    )
 
     procedural_map_bank: ProceduralMapBank | None = None
     procedural_entity_names: tuple[str, ...] | None = None
@@ -251,6 +248,9 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
         cfg.config,
         navigation=navigation_cfg,
         laser=training_laser_cfg,
+        contact_collision=replace(
+            cfg.config.contact_collision, termination_mode=cfg.collision_termination_mode
+        ),
         mode=CbfRlModeConfig(
             use_cbf_action_filtering=cfg.use_cbf_action_filtering,
             use_cbf_reward_penalty=cfg.use_cbf_reward_penalty,
@@ -306,7 +306,12 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
         "nominal"
     )
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    suffix = f"_{cfg.run_name}" if cfg.run_name else f"_{mode_tag}_seed{cfg.seed}"
+    variant_tag = ""
+    if cfg.reward_profile != "original":
+        variant_tag += f"_{cfg.reward_profile}"
+    if abs(high_level_hz - 1.0 / CBF_RL_HIGH_LEVEL_DT) > 1.0e-6:
+        variant_tag += f"_{high_level_hz:g}hz"
+    suffix = f"_{cfg.run_name}" if cfg.run_name else f"_{mode_tag}{variant_tag}_seed{cfg.seed}"
     log_dir = Path("logs/rsl_rl") / cfg.experiment_name / f"{stamp}{suffix}"
     log_dir.mkdir(parents=True, exist_ok=True)
     dump_yaml(log_dir / "params" / "navigation.yaml", asdict(method_cfg.navigation))
@@ -336,7 +341,10 @@ def run(task_id: str, cfg: TrainCbfRlConfig) -> None:
         runner.load(str(checkpoint))
 
     print(
-        f"[CBF-RL] mode={mode_tag} margin(footprint_clearance_m)={method_cfg.safety.footprint_clearance_m:.5f}m "
+        f"[CBF-RL] mode={mode_tag} reward_profile={method_cfg.reward.profile} "
+        f"cbf_reward_scale={env.cbf_reward_scale:g} "
+        f"termination={method_cfg.contact_collision.termination_mode} "
+        f"margin(footprint_clearance_m)={method_cfg.safety.footprint_clearance_m:.5f}m "
         f"(from safety_clearance={method_cfg.safety.d_safe:.2f}m) "
         f"high_level_hz={1.0 / method_cfg.navigation.high_level_dt:g} num_envs={cfg.num_envs}"
     )

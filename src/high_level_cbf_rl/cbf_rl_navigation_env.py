@@ -8,14 +8,14 @@ import torch
 # CbfRlNavigationEnv subclasses LaserSacNavigationEnv (LiDAR wiring, procedural
 # map resets) from SAFTER_src, falling back to src/ when SAFTER_src is absent.
 try:
-    from SAFTER_src.high_level_laser_sac.config import LaserRewardConfig
     from SAFTER_src.high_level_laser_sac.sac_navigation_env import LaserSacNavigationEnv
+    from SAFTER_src.high_level_rl.math_utils import world_to_body
 except ModuleNotFoundError:
-    from src.high_level_laser_sac.config import LaserRewardConfig
     from src.high_level_laser_sac.sac_navigation_env import LaserSacNavigationEnv
+    from src.high_level_rl.math_utils import world_to_body
 from src.high_level_rl.laser_cbf_filters import LaserScanCbfClosedForm
 
-from .config import CbfRlConfig
+from .config import CbfRlConfig, resolve_cbf_reward_scale
 
 
 class CbfRlNavigationEnv(LaserSacNavigationEnv):
@@ -51,9 +51,9 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             low_policy,
             command_interface,
             cfg.navigation,
-            # Required by the parent constructor but unused: step() reads
-            # cfg.reward (CbfRlRewardConfig).
-            reward_cfg=LaserRewardConfig(),
+            # Required by the parent constructor; step() reads cfg.reward
+            # (CbfRlRewardConfig), whose new_reward_profile uses these weights.
+            reward_cfg=cfg.reward.navigation_reward,
             laser_cfg=cfg.laser,
             safety_cfg=cfg.safety,
             contact_collision_cfg=cfg.contact_collision,
@@ -82,6 +82,11 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         )
         self.mode_cfg = cfg.mode
         self.cbf_reward_cfg = cfg.reward
+        if cfg.reward.profile not in ("original", "new_reward_profile"):
+            raise ValueError(f"Unknown CBF-RL reward profile {cfg.reward.profile!r}")
+        if cfg.reward.profile == "new_reward_profile" and cfg.reward.navigation_reward.profile != "original":
+            raise ValueError("new_reward_profile uses the laser-SAC 'original' navigation terms")
+        self.cbf_reward_scale = resolve_cbf_reward_scale(cfg.reward, cfg.navigation)
         if self._any_square_slot and safety.collision_geometry != "circle":
             # Box-vs-ellipse Minkowski overlap is not implemented (as in step_safe()).
             raise ValueError(
@@ -112,6 +117,51 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         action = torch.clamp(action, -1.0, 1.0)
         return self._action_center + action * self._action_half_range
 
+    def _sac_navigation_reward_terms(
+        self,
+        *,
+        progress: torch.Tensor,
+        position: torch.Tensor,
+        yaw: torch.Tensor,
+        planar_velocity_b: torch.Tensor,
+        yaw_rate: torch.Tensor,
+        safe: torch.Tensor,
+        previous_safe: torch.Tensor,
+        goal: torch.Tensor,
+        collision: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Navigation terms of LaserSacNavigationEnv.step_safe (``original`` profile).
+
+        Same formulas and weights as the laser-SAC reward. Its cbf_correction
+        term is omitted: the CBF-RL violation/match terms take its place.
+        """
+        nav_cfg = self.navigation_cfg
+        r = self.cbf_reward_cfg.navigation_reward
+        dt_scale = float(nav_cfg.high_level_dt) / float(r.reference_dt)
+        max_vx = max(nav_cfg.action.max_vx, 1.0e-6)
+        max_wz = max(nav_cfg.action.max_wz, 1.0e-6)
+
+        goal_b = world_to_body(self.goal_positions - position, yaw)
+        beta = torch.atan2(goal_b[:, 1], goal_b[:, 0])
+        vx_measured = planar_velocity_b[:, 0]
+        forward_alignment = (torch.relu(vx_measured) / max_vx) * torch.cos(beta)
+        reverse_cost = (torch.relu(-vx_measured) / max_vx).pow(2)
+        omega_ref = torch.clamp(r.yaw_gain * beta, -nav_cfg.action.max_wz, nav_cfg.action.max_wz)
+        yaw_tracking_cost = ((yaw_rate - omega_ref) / max_wz).pow(2)
+        smoothness = torch.sum((safe - previous_safe).pow(2), dim=-1)
+        return {
+            "progress": r.progress_weight * progress,
+            "time": torch.full_like(progress, -r.time_penalty * dt_scale),
+            "forward_alignment": (dt_scale * r.forward_alignment_weight) * forward_alignment,
+            "reverse_motion": -(dt_scale * r.reverse_motion_weight) * reverse_cost,
+            "yaw_tracking": -(dt_scale * r.yaw_tracking_weight) * yaw_tracking_cost,
+            "smoothness": -(dt_scale * r.smoothness_weight) * smoothness,
+            "goal": r.goal_bonus * goal.float(),
+            "timeout": -r.timeout_penalty * truncated.float(),
+            "collision": -r.collision_penalty * collision.float(),
+        }
+
     def step(self, action: torch.Tensor):
         self._maybe_refresh_laser_cache()
         nav_cfg = self.navigation_cfg
@@ -127,12 +177,31 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         previous_safe = self.previous_safe_command.clone()
         previous_distance = self.previous_goal_distance.clone()
 
+        contact_cfg = self.contact_collision_cfg
+        use_contact_sensors = contact_cfg.termination_mode == "direct_contact"
+        terminal_body_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        penalized_body_contact = torch.zeros_like(terminal_body_contact)
+        hard_body_contact = torch.zeros_like(terminal_body_contact)
+
         for _ in range(nav_cfg.low_steps_per_high_step):
             low_obs = self.low_env.get_observations()
             joint_action = self.low_policy(low_obs, safe)
             self.low_env.step(joint_action)
+            if use_contact_sensors:
+                # Same contact-force thresholds as LaserSacNavigationEnv.step_safe().
+                terminal_sensor = self.unwrapped.scene[contact_cfg.terminal_sensor_name]
+                penalized_sensor = self.unwrapped.scene[contact_cfg.penalized_sensor_name]
+                terminal_force = torch.linalg.vector_norm(
+                    terminal_sensor.data.force[..., :2], dim=-1
+                ).amax(dim=-1)
+                penalized_force = torch.linalg.vector_norm(
+                    penalized_sensor.data.force[..., :2], dim=-1
+                ).amax(dim=-1)
+                terminal_body_contact |= terminal_force > contact_cfg.terminal_force_threshold_n
+                penalized_body_contact |= penalized_force > contact_cfg.penalized_force_threshold_n
+                hard_body_contact |= penalized_force > contact_cfg.hard_force_threshold_n
 
-        pos, _, _, _, roll, pitch, yaw = self._root_state()
+        pos, _, vel_b, ang_b, roll, pitch, yaw = self._root_state()
         # Snapshot before autoreset: simulator state tensors can be views.
         p = pos[:, :2].detach().clone()
         distance = torch.linalg.norm(self.goal_positions - p, dim=-1)
@@ -181,7 +250,19 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             | (p[:, 1] <= nav_cfg.arena.y_min)
             | (p[:, 1] >= nav_cfg.arena.y_max)
         )
-        collision = obstacle_collision | outside
+        termination_mode = contact_cfg.termination_mode
+        if termination_mode == "circle":
+            # Geometric footprint overlap with an obstacle, or leaving the arena.
+            collision = obstacle_collision | outside
+            collision_reward_event = collision
+            obstacle_contact = obstacle_collision
+        elif termination_mode == "direct_contact":
+            # Contact-force termination, as in the SAC training environment.
+            collision = terminal_body_contact | hard_body_contact | outside
+            collision_reward_event = penalized_body_contact | collision
+            obstacle_contact = (terminal_body_contact | hard_body_contact) & ~outside
+        else:
+            raise ValueError(f"Unknown collision termination mode {termination_mode!r}")
         fallen = (
             (pos[:, 2] < nav_cfg.minimum_base_height)
             | (torch.abs(roll) > nav_cfg.maximum_roll_pitch)
@@ -199,27 +280,46 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         active_mask = (~terminated).float()
 
         r = self.cbf_reward_cfg
-        dt_scale = float(nav_cfg.high_level_dt) / float(r.reference_dt)
-        progress_reward = (
-            r.progress_weight
-            * progress
-            / max(nav_cfg.action.max_vx * nav_cfg.high_level_dt, 1.0e-8)
-            * active_mask
-        )
-        alive_reward = r.alive_reward * dt_scale * active_mask
-        goal_reward = r.goal_reward * goal.float()
-        obstacle_reward = -r.obstacle_penalty * obstacle_collision.float()
-        wall_reward = -r.wall_penalty * outside.float()
-        timeout_reward = -r.timeout_penalty * truncated.float()
+        if r.profile == "new_reward_profile":
+            navigation_components = self._sac_navigation_reward_terms(
+                progress=progress,
+                position=p,
+                yaw=yaw,
+                planar_velocity_b=vel_b[:, :2],
+                yaw_rate=ang_b[:, 2],
+                safe=safe,
+                previous_safe=previous_safe,
+                goal=goal,
+                collision=collision_reward_event,
+                truncated=truncated,
+            )
+        else:
+            dt_scale = float(nav_cfg.high_level_dt) / float(r.reference_dt)
+            navigation_components = {
+                "progress": (
+                    r.progress_weight
+                    * progress
+                    / max(nav_cfg.action.max_vx * nav_cfg.high_level_dt, 1.0e-8)
+                    * active_mask
+                ),
+                "alive": r.alive_reward * dt_scale * active_mask,
+                "goal": r.goal_reward * goal.float(),
+                "obstacle": -r.obstacle_penalty * obstacle_contact.float(),
+                "wall": -r.wall_penalty * outside.float(),
+                "timeout": -r.timeout_penalty * truncated.float(),
+            }
+        progress_reward = navigation_components["progress"]
 
         if self.mode_cfg.use_cbf_reward_penalty:
             violation_reward = (
-                r.cbf_violation_weight
+                self.cbf_reward_scale
+                * r.cbf_violation_weight
                 * torch.clamp(safety.cbf_value_nominal, max=0.0)
                 * active_mask
             )
             match_reward = (
-                r.cbf_match_weight
+                self.cbf_reward_scale
+                * r.cbf_match_weight
                 * (torch.exp(-(safety.correction_norm ** 2) / (r.cbf_match_sigma ** 2)) - 1.0)
                 * active_mask
             )
@@ -228,12 +328,7 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
             match_reward = torch.zeros_like(progress_reward)
 
         reward = (
-            progress_reward
-            + alive_reward
-            + goal_reward
-            + obstacle_reward
-            + wall_reward
-            + timeout_reward
+            torch.stack(tuple(navigation_components.values()), dim=0).sum(dim=0)
             + violation_reward
             + match_reward
         )
@@ -248,6 +343,9 @@ class CbfRlNavigationEnv(LaserSacNavigationEnv):
         smoothness = torch.sum((safe - previous_safe).pow(2), dim=-1)
         log = {
             "reward_progress": progress.mean(),
+            **{f"reward_term_{name}": value.mean() for name, value in navigation_components.items()},
+            "reward_term_cbf_violation": violation_reward.mean(),
+            "reward_term_cbf_match": match_reward.mean(),
             # Per-step indicator means (live signal); not comparable to the
             # per-episode rolling-100 rates below.
             "success_rate": goal.float().mean(),
