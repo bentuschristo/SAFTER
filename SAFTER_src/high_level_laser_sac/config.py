@@ -8,9 +8,7 @@ from SAFTER_src.high_level_rl.config import HighLevelNavigationConfig
 
 @dataclass(frozen=True)
 class SacHyperparameters:
-    """Copied from (was previously imported cross-package from) the old
-    map-based src/high_level_sac/config.py -- inlined here so SAFTER_src has
-    no dependency on that package. Keep in sync manually if it changes there."""
+    """Soft Actor-Critic hyperparameters for the laser-based navigation policy."""
 
     hidden_dims: tuple[int, ...] = (512, 256, 128)
     # gamma and tau are both *per-decision* persistence/decay factors, not
@@ -27,8 +25,8 @@ class SacHyperparameters:
     # gamma_effective = gamma**(high_level_dt/reference_dt) and
     # tau_effective = 1-(1-tau)**(high_level_dt/reference_dt) so the same
     # *effective per-second* discounting/target-tracking rate is preserved
-    # at any high_level_dt. 1.0 ratio (hence no change) at the archived
-    # default high_level_dt == reference_dt.
+    # at any high_level_dt. The ratio is 1.0 (hence no change) at the default
+    # high_level_dt == reference_dt.
     reference_dt: float = 0.10
     gamma: float = 0.99
     tau: float = 0.005
@@ -72,13 +70,13 @@ LaserSacMethod = Literal[
     "bcbf_lse_qp",
 ]
 CollisionGeometry = Literal["circle", "ellipse"]
-CollisionTerminationMode = Literal["circle", "seanav_contact"]
+CollisionTerminationMode = Literal["circle", "direct_contact"]
 LidarNoisePreset = Literal["clean", "nominal", "moderate", "severe"]
 # "legacy_inflated_ellipse": original velocity-inflated terminal ellipse
 #   (delta_b(T) = backup_margin + sqrt(vx^2+vy^2+eps^2)-eps folded directly
 #   into the semi-axes). Not generally forward-invariant under the
 #   zero-surrogate backup (see laser_cbf_filters.py terminal_h_and_grad_future
-#   docstring) -- kept only for old-vs-new comparison.
+#   docstring) -- retained for comparison.
 # "invariant_ellipse": fixed-geometry terminal ellipse (R_x=r_x+backup_margin,
 #   R_y=r_y+backup_margin, no velocity folded into the axes) intersected with
 #   a separate residual-motion recoverability condition. See
@@ -91,7 +89,7 @@ LIDAR_NOISE_BOUNDS_M: dict[str, tuple[float, float]] = {
     "clean": (0.0, 0.0),
     "nominal": (0.005, 0.030),
     "moderate": (0.005, 0.050),
-    # Retain the old 0.15 m far-range bound only for severe robustness tests.
+    # 0.15 m far-range bound, for severe robustness tests.
     "severe": (0.005, 0.150),
 }
 
@@ -115,9 +113,8 @@ class LaserObservationConfig:
     debug_vis: bool = False
     # How often (in seconds) the LiDAR is actually re-sampled, independent of
     # how often the high-level policy is queried (navigation.high_level_dt).
-    # Defaults to matching the archived 10 Hz high-level cadence exactly, so
-    # any existing config with high_level_dt=0.10 gets a refresh interval of
-    # 1 step -- i.e. unchanged behavior (a fresh reading every high-level
+    # Defaults to the 10 Hz high-level cadence, so with high_level_dt=0.10 the
+    # refresh interval is 1 step (a fresh reading every high-level
     # step). Set navigation.high_level_dt faster (e.g. 0.02, matching
     # low_level_dt) while leaving this at 0.10 to decouple decision rate from
     # sensor rate: the policy is queried every step, but reuses the same
@@ -128,14 +125,12 @@ class LaserObservationConfig:
 
 @dataclass(frozen=True)
 class LaserRewardConfig:
-    # ``original`` is the archived 10 Hz high-level reward.  The separate
-    # ``seanav_comparable`` launcher changes only the analogous goal,
-    # collision/unsafe-termination, and timeout terms; all other shaping terms
-    # below remain unchanged by design.
+    # ``original`` is the 10 Hz high-level reward.  ``seanav_comparable``
+    # changes only the analogous goal, collision/unsafe-termination, and
+    # timeout terms; all other shaping terms below are shared by both profiles.
     profile: RewardProfile = "original"
     # The high_level_dt every weight below (except progress_weight and the
-    # one-time episode-outcome bonuses/penalties) was tuned at, and every
-    # currently-deployed checkpoint was trained at. Per-step shaping terms
+    # one-time episode-outcome bonuses/penalties) was tuned at. Per-step shaping terms
     # (time, forward_alignment, reverse_motion, yaw_tracking, smoothness,
     # cbf_correction) are auto-scaled by navigation.high_level_dt /
     # reference_dt at reward-computation time (see step_safe), so their
@@ -151,9 +146,7 @@ class LaserRewardConfig:
     # they fire once per episode outcome, not once per second, so they don't
     # have the "accumulates faster at a smaller dt" problem in the first
     # place. At the default high_level_dt == reference_dt, the scale factor
-    # is exactly 1.0 and every weight below behaves byte-for-byte as before
-    # -- this is purely additive, not a behavior change at the archived
-    # operating point.
+    # is exactly 1.0 and every weight below applies as written.
     reference_dt: float = 0.10
     progress_weight: float = 4.0
     goal_bonus: float = 30.0
@@ -174,21 +167,13 @@ class LaserRewardConfig:
     seanav_collision_scale: float = -4.0
     seanav_collision_velocity_scale: float = 4.0
     seanav_termination_scale: float = -100.0
-    # SEA-Nav's own reward has no timeout term at all (matched here by the
-    # old 0.0 default) -- but that is only safe in SEA-Nav's own reward
-    # because it also has a "stuck" term (scale=-5.0: dead-end/no-progress
-    # penalty) that discourages a policy from loitering near the goal to
-    # dodge collision risk instead of committing to the final approach.
-    # "stuck" was never ported to this reward (see the reward-recheck
-    # table), so seanav_timeout_scale=0.0 here removed ALL pressure against
-    # exactly that stalling failure mode -- plausibly why seaspeed
-    # seanav_comparable training was observed to reach a good success rate
-    # early and then erode as training continued (SAC's exploration entropy
-    # decays, letting the policy settle into the now-unpunished stall).
-    # 2026-09-14: set to SEA-Nav's own "stuck" scale as the closest existing
-    # analog (both terms penalize "failed to make progress"), rather than an
-    # arbitrary new value, restoring the missing pressure without inventing
-    # an unrelated one.
+    # SEA-Nav's own reward has no timeout term; it relies on a "stuck" term
+    # (scale=-5.0: dead-end/no-progress penalty) that discourages a policy from
+    # loitering near the goal to dodge collision risk instead of committing to
+    # the final approach. That "stuck" term is not part of this reward, so the
+    # timeout scale is set to SEA-Nav's "stuck" scale as the closest analog
+    # (both terms penalize failing to make progress), which keeps pressure
+    # against stalling.
     seanav_timeout_scale: float = -5.0
 
 
@@ -201,10 +186,10 @@ class ContactCollisionConfig:
     penalized-contact threshold is used by the reward only.
     """
 
-    # ``circle`` reproduces the archived SAC footprint-overlap termination.
-    # ``seanav_contact`` uses MuJoCo body-contact forces as a simulator-native
+    # ``circle`` is the SAC footprint-overlap termination.
+    # ``direct_contact`` uses MuJoCo body-contact forces as a simulator-native
     # approximation of SEA-Nav's Isaac Gym contact termination.
-    termination_mode: CollisionTerminationMode = "seanav_contact"
+    termination_mode: CollisionTerminationMode = "direct_contact"
     terminal_sensor_name: str = "navigation_terminal_body_contact"
     penalized_sensor_name: str = "navigation_nonfoot_body_contact"
     terminal_force_threshold_n: float = 1.0
@@ -242,7 +227,7 @@ class LaserSafetyConfig:
     footprint_clearance_m: float = 0.15
     use_elliptic_footprint: bool = True
     # Collision termination geometry is independent from the LiDAR filter
-    # footprint. "circle" reproduces the archived 0.30 m collision proxy.
+    # footprint. "circle" is the 0.30 m collision proxy.
     collision_geometry: CollisionGeometry = "ellipse"
     collision_circle_radius_m: float = 0.30
     # Ground-truth geometry is used only for collision termination.  Inflate
@@ -273,35 +258,24 @@ class LaserSafetyConfig:
     backup_samples: int = 21
     backup_rollout_substeps: int = 8
 
-    # v6 terminal-set construction. invariant_ellipse (the new, two-condition
-    # forward-invariant terminal set: h_B_geom + h_B_rec) is now the default,
-    # per 2026-09-10 evaluation results -- "legacy_inflated_ellipse" remains
-    # available (e.g. to reproduce pre-2026-09-07 checkpoints) but is no
-    # longer the default.
+    # Terminal-set construction. invariant_ellipse (two-condition
+    # forward-invariant terminal set: h_B_geom + h_B_rec) is the default;
+    # "legacy_inflated_ellipse" is available for comparison.
     terminal_backup_mode: TerminalBackupMode = "invariant_ellipse"
-    # Positive normalization scales applied to the two new dimensionless
+    # Positive normalization scales applied to the two dimensionless
     # invariant-ellipse terminal constituents before they enter the
-    # kappa_backup LSE. Left at 1.0 (unscaled) until the unnormalized
-    # distributions have been logged and inspected -- do not tune silently.
+    # kappa_backup LSE. 1.0 leaves them unscaled.
     terminal_geom_scale: float = 1.0
     terminal_rec_scale: float = 1.0
 
-    # 2026-09-10: independent of terminal_backup_mode above -- this instead
-    # controls which projection step bcbf_cf's filter uses. False (default)
-    # is the 2026-09-07 joint box+half-space projection (zoh_surrogate_bounds
+    # Selects which projection step bcbf_cf's filter uses, independent of
+    # terminal_backup_mode above. True (default) projects onto the CBF
+    # half-space alone (_exact_projection, no box baked in) and relies on a
+    # post-hoc clamp -- the same projection cbf_cd_cf's filter uses. False
+    # uses the joint box+half-space projection (zoh_surrogate_bounds
     # + _exact_box_halfspace_projection), which bounds the achievable
     # surrogate command given the ZOH decay BEFORE projecting, so a
-    # subsequent hard clip can't invalidate the CBF guarantee. True reverts
-    # to the pre-fix behavior: project onto the CBF half-space alone
-    # (_exact_projection, no box baked in) and rely on a naive post-hoc
-    # clamp -- the same projection cbf_cd_cf's filter has always used, and
-    # the same one every bcbf_cf checkpoint trained before 2026-09-07 used.
-    # Lets the terminal-set change and the projection change be isolated
-    # one at a time instead of always moving together. True (the pre-2026-09-07
-    # single-half-space projection) is now the default, per 2026-09-10
-    # evaluation results on "clustered" -- the joint box+half-space projection
-    # remains available (legacy_projection=False) for anyone who wants the
-    # stricter hard-clip-consistency guarantee instead.
+    # subsequent hard clip cannot invalidate the CBF guarantee.
     legacy_projection: bool = True
 
     control_dynamics_a: tuple[float, float, float] = (8.0, 8.0, 8.0)

@@ -11,8 +11,8 @@ This script is the laser-observation analogue of evaluate_unseen_maps_all_method
 It generates structured start/goal scenarios so that the intended obstacle
 layout is actually tested. The default evaluation set is the three maps
 "low_shift"/"medium_shift"/"high_shift" (loaded from "Maps/Evaluation Maps/"
--- see _load_evaluation_maps below); every other map variant this file used
-to carry inline now lives in legacy_unseen_maps.py.
+-- see _load_evaluation_maps below); additional map variants live in
+legacy_unseen_maps.py.
 
 Each map has a start box and a goal box. The sampler rejects cases where
 start/goal are too close to obstacles/walls and, by default, rejects cases where
@@ -69,22 +69,13 @@ import src.tasks  # noqa: F401,E402
 # -----------------------------------------------------------------------------
 # Evaluation maps: low_shift / medium_shift / high_shift.
 #
-# As of 2026-11, this structured evaluator's default map set was reduced to
-# exactly these three maps -- the "low-shift", "medium-shift", "high-shift"
-# trio from the reference obstacle-layout image -- loaded from JSON data
-# files under "Maps/Evaluation Maps/" rather than carried as inline Python
-# literals. They were previously named "slalom" (low_shift), "corridor"
-# (medium_shift), and "corridor_derived_highshift_v5" (high_shift) in this
-# file's old UNSEEN_MAPS/STRUCTURED_SCENARIO_REGIONS dicts.
+# The default map set is exactly these three maps (low-shift, medium-shift,
+# high-shift), loaded from JSON data files under "Maps/Evaluation Maps/".
 #
-# Every other map variant this file used to define inline (all the
-# exploratory/superseded/OOD/distribution-shift/dynamic-obstacle designs, with
-# their original design-rationale comments preserved verbatim) was relocated
-# to SAFTER_scripts/laser_unseen_eval/legacy_unseen_maps.py as
-# LEGACY_UNSEEN_MAPS/LEGACY_STRUCTURED_SCENARIO_REGIONS -- not deleted, just no
-# longer part of this evaluator's default pipeline. That module is NOT
-# imported here deliberately; import it directly if you need one of those
-# older maps again.
+# Additional map variants (exploratory/OOD/distribution-shift/dynamic-obstacle
+# designs) live in SAFTER_scripts/laser_unseen_eval/legacy_unseen_maps.py as
+# LEGACY_UNSEEN_MAPS/LEGACY_STRUCTURED_SCENARIO_REGIONS. That module is not
+# imported here; import it directly to use one of those maps.
 _EVALUATION_MAPS_DIR = ROOT / "Maps" / "Evaluation Maps"
 _EVALUATION_MAP_NAMES = ("low_shift", "medium_shift", "high_shift")
 
@@ -95,7 +86,7 @@ def _load_evaluation_maps(maps_dir: Path) -> tuple[
 ]:
     """Load the low_shift/medium_shift/high_shift JSON map files into the
     exact UNSEEN_MAPS / STRUCTURED_SCENARIO_REGIONS shapes the rest of this
-    file has always expected, so nothing downstream needs to change."""
+    file expects."""
     unseen_maps: dict[str, tuple[CircularObstacle, ...]] = {}
     regions: dict[str, dict[str, tuple[float, float, float, float]]] = {}
     for name in _EVALUATION_MAP_NAMES:
@@ -136,14 +127,10 @@ UNSEEN_MAPS, STRUCTURED_SCENARIO_REGIONS = _load_evaluation_maps(_EVALUATION_MAP
 # -----------------------------------------------------------------------------
 # Dynamic (moving) obstacles.
 #
-# Ported from the trajectory math in the untested/uncommitted prototype
-# scripts_v5/laser_unseen_eval/evaluate_laser_dynamic_obstacles_three_methods.py
-# (2026-08-10), but wired into THIS evaluator's safety-validated pipeline
-# instead of that prototype's older helper (evaluate_laser_unseen_maps_four_methods.py),
-# which never set collision.termination_mode (defaults to "seanav_contact"
-# but never creates a contact sensor -- would crash or silently mis-detect
-# collisions) and reused the old max_obstacles=max(len(obstacles), 9) floor
-# bug this session already fixed for the static maps above.
+# The environment is built through this evaluator's safety-validated pipeline,
+# which sets collision.termination_mode explicitly (the "direct_contact" default
+# never creates a contact sensor and would crash or silently mis-detect
+# collisions) and uses max_obstacles equal to the actual obstacle count.
 #
 # Convention: for any map name present in DYNAMIC_OBSTACLE_COUNTS, the LAST
 # N entries of UNSEEN_MAPS[map_name] (N = the registered count) are the
@@ -249,8 +236,7 @@ def _position_on_waypoints(
 # map name. A map absent from this dict is treated as fully static. Populated
 # below from len(DYNAMIC_OBSTACLE_SPECS[name]) -- never hardcode these counts
 # here; a mismatch with the actual spec tuple length causes obstacle_centers
-# slice-assignment shape errors at env build time (hit once already when a
-# redesign changed obstacle counts but this dict was left stale).
+# slice-assignment shape errors at env build time.
 DYNAMIC_OBSTACLE_COUNTS: dict[str, int] = {}
 
 # The DynamicObstacleSpec for each dynamic obstacle, in the same trailing
@@ -261,6 +247,12 @@ DYNAMIC_OBSTACLE_SPECS: dict[str, tuple[DynamicObstacleSpec, ...]] = {}
 def _dynamic_spec_positions_at_t0(specs: tuple[DynamicObstacleSpec, ...]) -> tuple[tuple[float, float], ...]:
     return tuple(spec.position_at(0.0) for spec in specs)
 
+
+# Noise floor for the clip-vs-CBF-certificate diagnostic (residual_exec).
+# Float32 projection noise is ~1e-6..1e-7 (s^-1); real violations are
+# >=1e-1..10 (s^-1) -- several orders of magnitude apart -- so this threshold
+# cleanly separates them.
+BARRIER_VIOLATION_EPS = 1.0e-3
 
 DEFAULT_LOW ="logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt"
 DEFAULT_VANILLA = "logs/sac_laser/go2_safe_navigation_sac_laser_vanilla/2026-07-10_14-13-58_vanilla_laser/model_step_200000.pt"
@@ -299,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collision-margin-m", type=float, default=0.05)
     parser.add_argument(
         "--collision-termination-mode",
-        choices=("circle", "seanav_contact"),
+        choices=("circle", "direct_contact"),
         default="circle",
     )
     parser.add_argument(
@@ -313,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--terminal-rec-scale", type=float, default=1.0)
     parser.add_argument(
         "--legacy-projection", action=argparse.BooleanOptionalAction, default=False,
-        help="bcbf_cf only: use the pre-2026-09-07 single-half-space projection "
+        help="bcbf_cf only: use the single-half-space projection "
              "(_exact_projection + naive post-hoc clamp) instead of the joint "
              "box+half-space projection. Independent of --terminal-backup-mode. "
              "Must match what the checkpoint was trained with.",
@@ -344,6 +336,78 @@ def parse_args() -> argparse.Namespace:
              "the checkpoint's training-time --config.safety.backup-margin "
              "(load_actor's compatibility check will reject a mismatch). "
              "Leave unset (None) to use the LaserSafetyConfig default (0.30).",
+    )
+    parser.add_argument(
+        "--control-dynamics-a", type=float, nargs=3, default=None,
+        metavar=("AX", "AY", "AWZ"),
+        help="DELIBERATELY override the safety filter's assumed command-tracking "
+             "decay rate (used for backup-trajectory prediction) away from the "
+             "checkpoint's training-time value, to study sensitivity to "
+             "backup-dynamics-model mismatch -- requires --num-envs > 1. Unlike "
+             "every other safety-config flag, load_actor's compatibility check "
+             "ALLOWS a mismatch on this field when explicitly set here (see "
+             "allow_control_dynamics_a_mismatch): the actual simulated "
+             "dynamics and the frozen policy weights are unchanged, only the "
+             "filter's own belief about how fast commands are tracked. Leave "
+             "unset (None) to use the checkpoint's own training-time value "
+             "(the normal, non-mismatched evaluation).",
+    )
+    parser.add_argument(
+        "--backup-intent-decay-rate", type=float, default=None,
+        help="bcbf_cf's sidestep-then-stop backup-intent decay rate (only "
+             "relevant if backup_target_command is nonzero). Must match the "
+             "checkpoint's training-time --backup-intent-decay-rate for a "
+             "sidestep checkpoint (load_actor's strict check applies, same "
+             "as every other safety-config field except control_dynamics_a). "
+             "Also exposed so --control-dynamics-a sweeps on a zero-backup "
+             "checkpoint can move it out of the way when a swept value "
+             "happens to equal the default 2.0 1/s (resonant with "
+             "control_dynamics_a, raises ValueError). Leave unset (None) "
+             "for the LaserSafetyConfig default (2.0).",
+    )
+    parser.add_argument(
+        "--backup-target-vy", type=float, default=None,
+        help="bcbf_cf's sidestep-then-stop backup target lateral velocity "
+             "(sets safety.backup_target_command=(0, backup_target_vy, 0)). "
+             "Must match the checkpoint's training-time --backup-target-vy "
+             "-- load_actor's strict compatibility check applies to this "
+             "field (unlike control_dynamics_a, there is no mismatch "
+             "escape hatch for it: a sidestep checkpoint evaluated without "
+             "this flag will be rejected). Leave unset (None) for the "
+             "LaserSafetyConfig default (0.0, the original zero-backup "
+             "checkpoints).",
+    )
+    parser.add_argument(
+        "--kappa-scale", type=float, default=None,
+        help="DELIBERATELY scale all three LSE sharpness parameters "
+             "(kappa_backup, kappa_input, kappa_outer) proportionally away "
+             "from the LaserSafetyConfig defaults (50, 20, 20), to study "
+             "sensitivity to LSE-aggregation conservativeness -- requires "
+             "--num-envs > 1. Like control_dynamics_a, load_actor's "
+             "compatibility check ALLOWS a mismatch on these three fields "
+             "when this flag is explicitly set (see allow_kappa_mismatch): "
+             "every existing checkpoint was trained at the default "
+             "(equivalent to kappa_scale=1), so this re-evaluates an "
+             "already-trained, unmodified policy under a different "
+             "aggregation sharpness, not a different checkpoint. Leave "
+             "unset (None) to use the checkpoint's own value (kappa_scale=1 "
+             "for every existing checkpoint).",
+    )
+    parser.add_argument(
+        "--dump-states-path", type=str, default=None,
+        help="LSE-sensitivity analysis support: if set, "
+             "additionally snapshots (ranges, angles, current_command, "
+             "nominal_command) at every active step -- up to "
+             "--dump-states-max total snapshots -- to this path via "
+             "torch.save, for offline replay under different kappa "
+             "configurations without re-running the environment. "
+             "bcbf_cf-family methods only. Does not affect evaluation "
+             "outcomes.",
+    )
+    parser.add_argument(
+        "--dump-states-max", type=int, default=20000,
+        help="Cap on the number of per-step state snapshots collected when "
+             "--dump-states-path is set.",
     )
     parser.add_argument(
         "--high-level-dt", type=float, default=None,
@@ -385,6 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bcbf-nonlse-cd-qp-checkpoint", default=None)
     parser.add_argument("--cbf-lse-cd-qp-cfmatched-checkpoint", default=None)
     parser.add_argument("--bcbf-lse-cd-qp-cfmatched-checkpoint", default=None)
+    parser.add_argument("--bcbf-cd-lse-adapted-checkpoint", default=None)
     parser.add_argument("--qp-backend", "--bcbf-qp-backend", dest="qp_backend",
                         choices=("active_set", "qpth", "osqp"), default="osqp",
                         help="QP solver used at evaluation/deployment time (default: exact OSQP).")
@@ -406,7 +471,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=("vanilla", "cbf_cf_clip", "cbf_qp", "cbf_lse_qp", "cbf_cd_cf", "cbf_lse_cd_qp", "bcbf_cf", "bcbf_qp", "bcbf_lse_cd_qp", "bcbf_nonlse_cd_qp", "cbf_lse_cd_qp_cfmatched", "bcbf_lse_cd_qp_cfmatched"),
+        choices=("vanilla", "cbf_cf_clip", "cbf_qp", "cbf_lse_qp", "cbf_cd_cf", "cbf_lse_cd_qp", "bcbf_cf", "bcbf_qp", "bcbf_lse_cd_qp", "bcbf_nonlse_cd_qp", "cbf_lse_cd_qp_cfmatched", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted"),
         default=("vanilla", "cbf_cf_clip", "cbf_cd_cf", "bcbf_cf"),
     )
     parser.add_argument(
@@ -587,9 +652,51 @@ def summarize_episodes(episodes: list[dict[str, object]], **labels: object) -> d
         ("mean_total_actor_inference_batch_ms", "total_actor_inference_batch_ms"),
         ("mean_total_actor_inference_amortized_per_env_ms", "total_actor_inference_amortized_per_env_ms"),
         ("inference_deadline_miss_fraction", "inference_deadline_miss_fraction"),
+        ("clip_triggered_fraction", "clip_triggered_fraction"),
+        ("mean_clip_delta_m_s", "clip_delta_m_s"),
+        ("barrier_violated_post_clip_fraction", "barrier_violated_post_clip_fraction"),
     ):
         if episodes and field in episodes[0]:
             row.update(mean_stats([float(r[field]) for r in episodes], label))
+    if episodes and "max_clip_delta_m_s" in episodes[0]:
+        row["max_clip_delta_m_s"] = max(float(r["max_clip_delta_m_s"]) for r in episodes)
+    if episodes and "min_residual_exec" in episodes[0]:
+        row["min_residual_exec_overall"] = min(
+            (float(r["min_residual_exec"]) for r in episodes if math.isfinite(float(r["min_residual_exec"]))),
+            default=math.nan,
+        )
+    # Pooled-over-all-steps (not per-episode-averaged) clip-vs-barrier
+    # counters: a per-episode average is dominated by episodes with zero
+    # clip events (clipping is rare per-episode). The quantity of interest --
+    # conditional on the final hard clip changing the command, how often the
+    # as-executed command violates the CBF condition -- is computed by pooling
+    # raw step counts across every episode in this group, not by averaging
+    # each episode's own (often undefined) rate.
+    if episodes and "diag_steps" in episodes[0]:
+        total_diag_steps = sum(int(r["diag_steps"]) for r in episodes)
+        total_clip_steps = sum(int(r["clip_triggered_steps"]) for r in episodes)
+        total_clip_violations = sum(int(r["barrier_violated_given_clip_steps"]) for r in episodes)
+        total_no_clip_violations = sum(int(r["barrier_violated_given_no_clip_steps"]) for r in episodes)
+        row["pooled_diag_steps"] = total_diag_steps
+        row["pooled_clip_steps"] = total_clip_steps
+        row["pooled_clip_triggered_rate"] = total_clip_steps / max(total_diag_steps, 1)
+        row["pooled_barrier_violated_given_clip_rate"] = (
+            total_clip_violations / total_clip_steps if total_clip_steps > 0 else math.nan
+        )
+        row["pooled_barrier_violated_given_no_clip_rate"] = (
+            total_no_clip_violations / max(total_diag_steps - total_clip_steps, 1)
+        )
+        total_clip_feasible_steps = sum(int(r["clip_feasible_steps"]) for r in episodes)
+        total_clip_feasible_violations = sum(int(r["clip_feasible_violation_steps"]) for r in episodes)
+        row["pooled_clip_feasible_steps"] = total_clip_feasible_steps
+        row["pooled_clip_feasible_violation_steps"] = total_clip_feasible_violations
+        row["pooled_barrier_violated_given_clip_feasible_rate"] = (
+            total_clip_feasible_violations / total_clip_feasible_steps
+            if total_clip_feasible_steps > 0 else math.nan
+        )
+        row["pooled_clip_delta_norm_max"] = max(
+            (float(r["max_clip_delta_normalized"]) for r in episodes), default=math.nan
+        )
     return row
 
 
@@ -737,7 +844,7 @@ def add_navigation_laser_sensor(env_cfg, cfg: LaserSacConfig) -> None:
         ),
     )
     extra_sensors: tuple = ()
-    if contact.termination_mode == "seanav_contact":
+    if contact.termination_mode == "direct_contact":
         # These two contact sensors add real per-substep MuJoCo/mjWarp
         # contact-kernel cost and are the only consumers of
         # step_safe()'s contact-force readout. "circle" mode (the default,
@@ -804,12 +911,15 @@ def make_laser_config(
     integration_dt: float | None = None,
     backup_rollout_substeps: int | None = None,
     laser_debug_vis: bool = False,
+    control_dynamics_a: tuple[float, float, float] | None = None,
+    kappa_scale: float | None = None,
+    backup_intent_decay_rate: float | None = None,
+    backup_target_vy: float | None = None,
 ) -> LaserSacConfig:
     base = LaserSacConfig()
     # Default min_vx to -max_vx (symmetric) when not explicitly overridden,
-    # matching every action_max_vx-only caller that predates this field --
-    # NOT LaserSafetyConfig's own hardcoded -0.5 default, which would silently
-    # pair an overridden max_vx with a stale, unrelated min_vx otherwise.
+    # not LaserSafetyConfig's hardcoded -0.5 default, which would silently
+    # pair an overridden max_vx with an unrelated min_vx.
     resolved_min_vx = -float(action_max_vx) if action_min_vx is None else float(action_min_vx)
     action = replace(
         base.navigation.action,
@@ -853,6 +963,32 @@ def make_laser_config(
         **({} if backup_margin is None else {"backup_margin": float(backup_margin)}),
         **({} if integration_dt is None else {"integration_dt": float(integration_dt)}),
         **({} if backup_rollout_substeps is None else {"backup_rollout_substeps": int(backup_rollout_substeps)}),
+        # Deliberate backup-dynamics-model sensitivity override (see
+        # load_actor's allow_control_dynamics_a_mismatch): a value here that
+        # differs from the checkpoint's training-time control_dynamics_a
+        # simulates the safety filter having an INACCURATE assumed
+        # command-tracking decay rate for backup-trajectory prediction, while
+        # the actual simulated system dynamics (and the frozen policy
+        # weights) stay exactly as trained.
+        **({} if control_dynamics_a is None else {"control_dynamics_a": tuple(float(x) for x in control_dynamics_a)}),
+        # Scales all three LSE sharpness parameters proportionally
+        # (sensitivity study on LSE-aggregation conservativeness): kappa_scale
+        # multiplies the LaserSafetyConfig defaults (kappa_backup=50,
+        # kappa_input=20, kappa_outer=20), not the values the checkpoint was
+        # trained with; checkpoints are trained at kappa_scale=1 (the
+        # defaults), so the two coincide. See load_actor's
+        # allow_kappa_mismatch escape hatch.
+        **(
+            {}
+            if kappa_scale is None
+            else {
+                "kappa_backup": float(kappa_scale) * base.safety.kappa_backup,
+                "kappa_input": float(kappa_scale) * base.safety.kappa_input,
+                "kappa_outer": float(kappa_scale) * base.safety.kappa_outer,
+            }
+        ),
+        **({} if backup_intent_decay_rate is None else {"backup_intent_decay_rate": float(backup_intent_decay_rate)}),
+        **({} if backup_target_vy is None else {"backup_target_command": (0.0, float(backup_target_vy), 0.0)}),
     )
     reward = replace(
         base.reward,
@@ -996,6 +1132,10 @@ def build_environment(
     integration_dt: float | None = None,
     backup_rollout_substeps: int | None = None,
     laser_debug_vis: bool = False,
+    control_dynamics_a: tuple[float, float, float] | None = None,
+    kappa_scale: float | None = None,
+    backup_intent_decay_rate: float | None = None,
+    backup_target_vy: float | None = None,
 ):
     configure_torch_backends()
 
@@ -1030,6 +1170,10 @@ def build_environment(
         integration_dt=integration_dt,
         backup_rollout_substeps=backup_rollout_substeps,
         laser_debug_vis=laser_debug_vis,
+        control_dynamics_a=control_dynamics_a,
+        kappa_scale=kappa_scale,
+        backup_intent_decay_rate=backup_intent_decay_rate,
+        backup_target_vy=backup_target_vy,
     )
 
     env_cfg = load_env_cfg(task_id, play=True)
@@ -1107,7 +1251,15 @@ def build_environment(
     return raw_env, low_env, env, cfg, dynamic_runtime
 
 
-def load_actor(*, env: LaserSacNavigationEnv, cfg: LaserSacConfig, checkpoint_path: str, device: str) -> LaserSafeSacActor:
+def load_actor(
+    *,
+    env: LaserSacNavigationEnv,
+    cfg: LaserSacConfig,
+    checkpoint_path: str,
+    device: str,
+    allow_control_dynamics_a_mismatch: bool = False,
+    allow_kappa_mismatch: bool = False,
+) -> LaserSafeSacActor:
     obs = env.actor_tensor(env.get_observations())
     nav = env.navigation_cfg
     actor = LaserSafeSacActor(
@@ -1154,29 +1306,61 @@ def load_actor(*, env: LaserSacNavigationEnv, cfg: LaserSacConfig, checkpoint_pa
         if isinstance(saved_safety, dict):
             saved_safety.pop(runtime_key, None)
         current_safety.pop(runtime_key, None)
-    # Historical CF checkpoints predate the collision-geometry and QP-solver
-    # fields.  Missing new fields are compatible, and every field actually
-    # recorded in the checkpoint must still agree -- EXCEPT collision_geometry
-    # itself (see the pop below): it's a pure offline analytical-outcome
+    # Older checkpoints may predate the collision-geometry and QP-solver
+    # fields. Missing new fields are compatible, and every field actually
+    # recorded in the checkpoint must still agree -- except collision_geometry
+    # itself (see the pop below): it is a pure offline analytical-outcome
     # reclassification choice regardless of a checkpoint's vintage, so a
-    # legacy checkpoint (implicitly trained/evaluated under the 0.30 m circle
-    # definition, before this field existed) is just as eligible for
-    # reclassification under --collision-geometry ellipse as a checkpoint
-    # that explicitly recorded "circle". No blocking check needed here; the
-    # pop below already makes both old and new checkpoints indifferent to it.
+    # checkpoint that predates the field (implicitly the 0.30 m circle
+    # definition) is as eligible for reclassification under
+    # --collision-geometry ellipse as one that recorded "circle".
     # collision_geometry/collision_margin_m are a pure offline analytical
     # outcome-classification choice (see the "Analytical overlap is retained
     # strictly as an offline diagnostic" note in sac_navigation_env.py): the
     # formal safety violation/reward -- and the actor weights themselves --
-    # never depend on it, only the local LiDAR LSE barrier does. Free to
-    # swap at eval time without invalidating the checkpoint (2026-09-09,
-    # deliberate diagnostic run comparing circle vs. ellipse collision-outcome
-    # classification for an already-trained policy). Popped only after the
-    # legacy-checkpoint check above, which still needs to see the real value.
+    # never depend on it, only the local LiDAR LSE barrier does. They can be
+    # swapped at eval time without invalidating the checkpoint.
     for diagnostic_key in ("collision_geometry", "collision_margin_m"):
         if isinstance(saved_safety, dict):
             saved_safety.pop(diagnostic_key, None)
         current_safety.pop(diagnostic_key, None)
+    # control_dynamics_a IS normally part of the strict check below: unlike
+    # the runtime/diagnostic keys popped above, it changes the DISTRIBUTION
+    # the policy was trained under (the filter used it to project every
+    # training-time action), so silently tolerating a mismatch would hide a
+    # real train/eval inconsistency. allow_control_dynamics_a_mismatch is an
+    # explicit, opt-in escape hatch for deliberately studying that exact
+    # sensitivity (model-mismatch robustness of the backup-trajectory
+    # prediction) with an already-trained, otherwise-unmodified checkpoint --
+    # never set True for an ordinary evaluation.
+    if allow_control_dynamics_a_mismatch:
+        saved_value = saved_safety.get("control_dynamics_a") if isinstance(saved_safety, dict) else None
+        current_value = current_safety.get("control_dynamics_a")
+        if saved_value != current_value:
+            print(
+                f"[SENSITIVITY OVERRIDE] control_dynamics_a mismatch ALLOWED: "
+                f"checkpoint trained with {saved_value}, evaluating with {current_value}"
+            )
+        if isinstance(saved_safety, dict):
+            saved_safety.pop("control_dynamics_a", None)
+        current_safety.pop("control_dynamics_a", None)
+    # Same escape-hatch pattern as control_dynamics_a, for the LSE-sharpness
+    # sensitivity study (kappa_backup/kappa_input/kappa_outer). Every
+    # existing checkpoint trained at the defaults (50, 20, 20), so this
+    # re-evaluates an unmodified policy under different LSE conservativeness,
+    # not a genuinely different checkpoint config.
+    if allow_kappa_mismatch:
+        for kappa_key in ("kappa_backup", "kappa_input", "kappa_outer"):
+            saved_value = saved_safety.get(kappa_key) if isinstance(saved_safety, dict) else None
+            current_value = current_safety.get(kappa_key)
+            if saved_value != current_value:
+                print(
+                    f"[SENSITIVITY OVERRIDE] {kappa_key} mismatch ALLOWED: "
+                    f"checkpoint trained with {saved_value}, evaluating with {current_value}"
+                )
+            if isinstance(saved_safety, dict):
+                saved_safety.pop(kappa_key, None)
+            current_safety.pop(kappa_key, None)
     safety_mismatches = {}
     if isinstance(saved_safety, dict):
         safety_mismatches = {
@@ -1251,14 +1435,13 @@ def load_actor(*, env: LaserSacNavigationEnv, cfg: LaserSacConfig, checkpoint_pa
     # The local scan-point v2 model changes the safety-layer state and must not
     # silently load an older frozen-ray checkpoint.
     actor_state_dict = dict(checkpoint["actor"])
-    # 2026-09-13: action_scale (a single symmetric per-axis buffer) was
-    # replaced by action_low/action_high/action_center/action_half_range (an
-    # asymmetric-capable affine map -- see LaserSafeSacActor.min_vx). Both are
-    # derived purely from the (already compatibility-checked above) config,
-    # never learned, so a legacy checkpoint predating this change is missing
-    # the new keys and carries the old one instead -- fill the new keys from
-    # the freshly constructed actor's own (already-correct) buffers before
-    # loading, and drop the stale old key. strict=True is kept (this is the
+    # The actor's action buffers are action_low/action_high/action_center/
+    # action_half_range (an asymmetric-capable affine map -- see
+    # LaserSafeSacActor.min_vx). They are derived purely from the (already
+    # compatibility-checked above) config and never learned. Older checkpoints
+    # carry a single symmetric per-axis action_scale buffer instead, so the new
+    # keys are filled from the freshly constructed actor's own buffers before
+    # loading, and the old key is dropped. strict=True is kept (this is the
     # only special-cased rename) so any genuine missing/unexpected key --
     # e.g. an actual learned parameter -- still raises.
     actor_state_dict.pop("action_scale", None)
@@ -1810,22 +1993,18 @@ def generate_manifest_randomized(
 ) -> list[dict[str, object]]:
     """Generate randomized start/goal cases for one map.
 
-    This is an ADDITIVE alternative to generate_manifest(): instead of
-    drawing start/goal from STRUCTURED_SCENARIO_REGIONS's fixed, map-specific
-    boxes (a narrow vertical strip near one wall for start, the opposite wall
-    for goal), both endpoints are drawn independently from the FULL arena
-    interior. Every other validity check (obstacle/wall clearance, a
-    configurable minimum straight-line distance, and -- by default -- the
-    requirement that the direct start-goal segment actually pass near an
-    obstacle) is identical in spirit to generate_manifest(), duplicated here
-    rather than shared so that function is never touched by this one.
+    This is an alternative to generate_manifest(): instead of drawing
+    start/goal from STRUCTURED_SCENARIO_REGIONS's fixed, map-specific boxes,
+    both endpoints are drawn independently from the full arena interior.
+    Every other validity check (obstacle/wall clearance, a configurable
+    minimum straight-line distance, and -- by default -- the requirement that
+    the direct start-goal segment actually pass near an obstacle) mirrors
+    generate_manifest().
 
-    generate_manifest() and its STRUCTURED_SCENARIO_REGIONS-based scenario
-    banks are left completely unmodified; this function only adds a second,
-    independently-seeded and independently-stored scenario bank alongside it
+    The result is an independently-seeded, independently-stored scenario bank
     (see main()'s --randomize-start-goal flag, which writes this bank under
-    a distinctly-named "<map_name>_random" directory so it can never resume
-    from, or silently overwrite, an existing structured-region manifest).
+    a distinctly-named "<map_name>_random" directory so it never resumes
+    from, or overwrites, a structured-region manifest).
     """
     env.clear_fixed_scenario()
     rows: list[dict[str, object]] = []
@@ -2091,7 +2270,7 @@ def evaluate_method(
     if _dynamic_runtime is not None and _dynamic_runtime.active:
         raise NotImplementedError(
             "Dynamic-obstacle maps are only supported through evaluate_method_vectorized "
-            "(the batched entry point used by every eval CLI path this session)."
+            "(the batched entry point used by every eval CLI path)."
         )
 
     records: list[dict[str, object]] = []
@@ -2457,8 +2636,23 @@ def evaluate_method_vectorized(
     integration_dt: float | None = None,
     backup_rollout_substeps: int | None = None,
     disable_safety_filter: bool = False,
+    control_dynamics_a: tuple[float, float, float] | None = None,
+    kappa_scale: float | None = None,
+    backup_intent_decay_rate: float | None = None,
+    backup_target_vy: float | None = None,
+    dump_states_path: str | None = None,
+    dump_states_max: int = 20000,
 ) -> Path:
-    """Evaluate manifest cases in fixed-size vectorized batches."""
+    """Evaluate manifest cases in fixed-size vectorized batches.
+
+    dump_states_path (LSE-sensitivity analysis support): when
+    set, additionally snapshots (ranges, angles, current_command,
+    nominal_command) at every active step -- up to dump_states_max total
+    snapshots -- to a single torch.save'd file, for offline replay under
+    different LSE kappa configurations without re-running the environment.
+    Only supports the bcbf_cf-family observation layout (current_command =
+    obs[:, 5:8]); no effect on evaluation outcomes either way.
+    """
     if not manifest:
         raise ValueError("Cannot evaluate an empty manifest.")
     batch_size = min(int(num_envs), len(manifest))
@@ -2492,12 +2686,55 @@ def evaluate_method_vectorized(
         high_level_dt=high_level_dt,
         integration_dt=integration_dt,
         backup_rollout_substeps=backup_rollout_substeps,
+        control_dynamics_a=control_dynamics_a,
+        kappa_scale=kappa_scale,
+        backup_intent_decay_rate=backup_intent_decay_rate,
+        backup_target_vy=backup_target_vy,
     )
     records: list[dict[str, object]] = []
     trajectory_records: list[dict[str, object]] = []
+    dumped_states: list[dict[str, torch.Tensor]] = []
+    # Pooled (not per-episode-averaged) clip-vs-barrier-certificate counters:
+    # since clip events are rare per episode, a per-episode average would be
+    # dominated by many NaN/zero-sample episodes. Pooling over every step in
+    # the whole map evaluation gives a clean estimate of: of the steps where
+    # the final hard clip changed the command, what fraction left the
+    # as-executed command violating the CBF condition -- versus that same rate
+    # on steps where clipping was a no-op (the baseline rate, needed to
+    # isolate clip's own contribution).
+    pooled_diag_steps = 0
+    pooled_clip_steps = 0
+    pooled_clip_violation_steps = 0
+    pooled_no_clip_violation_steps = 0
+    # Of the clip-triggered steps, how many had a pre-clip (certified
+    # surrogate) command that satisfied the CBF residual -- i.e. a genuine
+    # "clipping broke a previously-valid certificate" event, as opposed to a
+    # step that was already infeasible/degenerate before clipping ever
+    # touched it. Cross-tabulated with the existing projection_feasible flag.
+    pooled_clip_feasible_steps = 0
+    pooled_clip_feasible_violation_steps = 0
+    # Box-diagonal normalization for "maximum normalized command change":
+    # the hard clip operates on [vx, vy, wz] jointly, so clip_delta is
+    # already a Euclidean norm over mixed units (m/s, m/s, rad/s); dividing
+    # by the admissible box's own diagonal extent gives a dimensionless
+    # fraction of the action range, comparable across configurations.
+    effective_min_vx = -float(action_max_vx) if action_min_vx is None else float(action_min_vx)
+    box_scale = math.sqrt(
+        (float(action_max_vx) - effective_min_vx) ** 2
+        + (2.0 * float(action_max_vy)) ** 2
+        + (2.0 * float(action_max_wz)) ** 2
+    )
+    pooled_clip_delta_norm_max = 0.0
     try:
         verify_compiled_physical_map(raw_env, env, map_name)
-        actor = load_actor(env=env, cfg=cfg, checkpoint_path=high_checkpoint, device=device)
+        actor = load_actor(
+            env=env,
+            cfg=cfg,
+            checkpoint_path=high_checkpoint,
+            device=device,
+            allow_control_dynamics_a_mismatch=control_dynamics_a is not None,
+            allow_kappa_mismatch=kappa_scale is not None,
+        )
         actor.disable_safety_filter = disable_safety_filter
         warmup_actor_timing(actor, env)
         dt = float(env.navigation_cfg.high_level_dt)
@@ -2552,6 +2789,17 @@ def evaluate_method_vectorized(
             ]
             active_steps = [0] * active_count
             infeasible_steps = [0] * active_count
+            clip_triggered_steps = [0] * active_count
+            clip_delta_sums = [0.0] * active_count
+            clip_delta_maxes = [0.0] * active_count
+            barrier_violated_post_clip_steps = [0] * active_count
+            residual_exec_mins = [math.inf] * active_count
+            diag_steps = [0] * active_count
+            barrier_violated_given_clip_steps = [0] * active_count
+            barrier_violated_given_no_clip_steps = [0] * active_count
+            clip_feasible_steps = [0] * active_count
+            clip_feasible_violation_steps = [0] * active_count
+            clip_delta_norm_maxes = [0.0] * active_count
             correction_sums = [0.0] * active_count
             returns = [0.0] * active_count
             step_counts = [0] * active_count
@@ -2567,6 +2815,19 @@ def evaluate_method_vectorized(
                     nominal, safe, safety, policy_ms, filter_ms, inference_ms = (
                         timed_deterministic_actor(actor, actor_obs)
                     )
+                    if dump_states_path is not None and len(dumped_states) < dump_states_max:
+                        active_mask = torch.tensor(
+                            [not finished[i] for i in range(active_count)], device=device
+                        )
+                        if active_mask.any():
+                            dumped_states.append(
+                                {
+                                    "ranges": actor._ranges(actor_obs)[:active_count][active_mask].detach().cpu(),
+                                    "angles": actor.ray_angles.detach().cpu(),
+                                    "current_command": actor_obs[:active_count, 5:8][active_mask].detach().cpu(),
+                                    "nominal_command": nominal[:active_count][active_mask].detach().cpu(),
+                                }
+                            )
                     next_obs, reward, done, extras = env.step_safe(nominal, safe, safety)
                     if dynamic_active:
                         global_step += 1
@@ -2617,6 +2878,45 @@ def evaluate_method_vectorized(
                         feasible_flags = getattr(safety, "projection_feasible", None)
                         if feasible_flags is not None:
                             infeasible_steps[env_id] += int(not bool(feasible_flags[env_id]))
+
+                        # Clip diagnostic: how often the final hard clip
+                        # (certified surrogate -> actuator-box-limited command)
+                        # actually changes the command, and whether that
+                        # as-executed command still satisfies the CBF
+                        # condition (residual_exec < 0 means clipping broke
+                        # the certificate for this step).
+                        clip_delta_flags = getattr(safety, "clip_delta", None)
+                        if clip_delta_flags is not None:
+                            clip_delta_value = float(clip_delta_flags[env_id].detach().cpu())
+                            clip_delta_sums[env_id] += clip_delta_value
+                            clip_delta_maxes[env_id] = max(clip_delta_maxes[env_id], clip_delta_value)
+                            clip_delta_norm_value = clip_delta_value / max(box_scale, 1.0e-12)
+                            clip_delta_norm_maxes[env_id] = max(clip_delta_norm_maxes[env_id], clip_delta_norm_value)
+                            pooled_clip_delta_norm_max = max(pooled_clip_delta_norm_max, clip_delta_norm_value)
+                        clip_changed_flags = getattr(safety, "clip_changed", None)
+                        if clip_changed_flags is not None:
+                            clip_triggered_steps[env_id] += int(bool(clip_changed_flags[env_id]))
+                        residual_exec_flags = getattr(safety, "residual_exec", None)
+                        if residual_exec_flags is not None:
+                            residual_exec_value = float(residual_exec_flags[env_id].detach().cpu())
+                            is_barrier_violated = residual_exec_value < -BARRIER_VIOLATION_EPS
+                            barrier_violated_post_clip_steps[env_id] += int(is_barrier_violated)
+                            residual_exec_mins[env_id] = min(residual_exec_mins[env_id], residual_exec_value)
+                            pooled_diag_steps += 1
+                            diag_steps[env_id] += 1
+                            step_clip_changed = clip_changed_flags is not None and bool(clip_changed_flags[env_id])
+                            if step_clip_changed:
+                                pooled_clip_steps += 1
+                                pooled_clip_violation_steps += int(is_barrier_violated)
+                                barrier_violated_given_clip_steps[env_id] += int(is_barrier_violated)
+                                if feasible_flags is None or bool(feasible_flags[env_id]):
+                                    pooled_clip_feasible_steps += 1
+                                    pooled_clip_feasible_violation_steps += int(is_barrier_violated)
+                                    clip_feasible_steps[env_id] += 1
+                                    clip_feasible_violation_steps[env_id] += int(is_barrier_violated)
+                            else:
+                                pooled_no_clip_violation_steps += int(is_barrier_violated)
+                                barrier_violated_given_no_clip_steps[env_id] += int(is_barrier_violated)
 
                         trajectory_row = None
                         if log_trajectories:
@@ -2669,6 +2969,17 @@ def evaluate_method_vectorized(
                                     .detach().cpu()
                                 ),
                                 "command_correction_norm": correction_value,
+                                "clip_delta_m_s": (
+                                    float(clip_delta_flags[env_id].detach().cpu())
+                                    if clip_delta_flags is not None else math.nan
+                                ),
+                                "clip_changed": (
+                                    int(bool(clip_changed_flags[env_id])) if clip_changed_flags is not None else 0
+                                ),
+                                "residual_exec": (
+                                    float(residual_exec_flags[env_id].detach().cpu())
+                                    if residual_exec_flags is not None else math.nan
+                                ),
                                 "filter_active": int(filter_active),
                                 "physical_clearance_m": clearance,
                                 "cumulative_path_length_m": path_lengths[env_id],
@@ -2745,6 +3056,20 @@ def evaluate_method_vectorized(
                                 "minimum_physical_clearance_m": minimum_clearances[env_id],
                                 "filter_active_fraction": active_steps[env_id] / max(step_counts[env_id], 1),
                                 "infeasible_fraction": infeasible_steps[env_id] / max(step_counts[env_id], 1),
+                                "clip_triggered_fraction": clip_triggered_steps[env_id] / max(step_counts[env_id], 1),
+                                "mean_clip_delta_m_s": clip_delta_sums[env_id] / max(step_counts[env_id], 1),
+                                "max_clip_delta_m_s": clip_delta_maxes[env_id],
+                                "barrier_violated_post_clip_fraction": barrier_violated_post_clip_steps[env_id] / max(step_counts[env_id], 1),
+                                "min_residual_exec": (
+                                    residual_exec_mins[env_id] if math.isfinite(residual_exec_mins[env_id]) else math.nan
+                                ),
+                                "diag_steps": diag_steps[env_id],
+                                "clip_triggered_steps": clip_triggered_steps[env_id],
+                                "barrier_violated_given_clip_steps": barrier_violated_given_clip_steps[env_id],
+                                "barrier_violated_given_no_clip_steps": barrier_violated_given_no_clip_steps[env_id],
+                                "clip_feasible_steps": clip_feasible_steps[env_id],
+                                "clip_feasible_violation_steps": clip_feasible_violation_steps[env_id],
+                                "max_clip_delta_normalized": clip_delta_norm_maxes[env_id],
                                 "mean_command_correction_norm": correction_sums[env_id] / max(step_counts[env_id], 1),
                                 "mean_safe_measured_velocity_error_norm": velocity_error_sums[env_id] / max(step_counts[env_id], 1),
                                 "mean_policy_inference_batch_ms": mean(policy_latency_rows[env_id]),
@@ -2771,8 +3096,8 @@ def evaluate_method_vectorized(
                         if trajectory_row is not None:
                             trajectory_records.append(trajectory_row)
                     # For dynamic maps, next_obs was computed inside step_safe
-                    # BEFORE this iteration's obstacle motion was applied above,
-                    # so it would be one step stale; re-fetch instead.
+                    # before this iteration's obstacle motion was applied above,
+                    # so it is one step stale; re-fetch instead.
                     obs = env.get_observations() if dynamic_active else next_obs
 
         records.sort(key=lambda row: int(row["case_id"]))
@@ -2808,6 +3133,35 @@ def evaluate_method_vectorized(
             "minimum_clearance_overall_m": min(float(row["minimum_physical_clearance_m"]) for row in records),
             "mean_filter_active_fraction": mean(float(row["filter_active_fraction"]) for row in records),
             "mean_infeasible_fraction": mean(float(row["infeasible_fraction"]) for row in records),
+            "mean_clip_triggered_fraction": mean(float(row["clip_triggered_fraction"]) for row in records),
+            "mean_clip_delta_m_s": mean(float(row["mean_clip_delta_m_s"]) for row in records),
+            "max_clip_delta_m_s": max(float(row["max_clip_delta_m_s"]) for row in records),
+            "mean_barrier_violated_post_clip_fraction": mean(
+                float(row["barrier_violated_post_clip_fraction"]) for row in records
+            ),
+            "min_residual_exec_overall": min(
+                (float(row["min_residual_exec"]) for row in records if math.isfinite(float(row["min_residual_exec"]))),
+                default=math.nan,
+            ),
+            # Pooled-over-all-steps versions of the same question, isolating
+            # clip's own contribution from the baseline violation rate (see
+            # comment at pooled_diag_steps' definition above).
+            "pooled_diag_steps": pooled_diag_steps,
+            "pooled_clip_steps": pooled_clip_steps,
+            "pooled_clip_triggered_rate": pooled_clip_steps / max(pooled_diag_steps, 1),
+            "pooled_barrier_violated_given_clip_rate": (
+                pooled_clip_violation_steps / pooled_clip_steps if pooled_clip_steps > 0 else math.nan
+            ),
+            "pooled_barrier_violated_given_no_clip_rate": (
+                pooled_no_clip_violation_steps / max(pooled_diag_steps - pooled_clip_steps, 1)
+            ),
+            "pooled_clip_feasible_steps": pooled_clip_feasible_steps,
+            "pooled_clip_feasible_violation_steps": pooled_clip_feasible_violation_steps,
+            "pooled_barrier_violated_given_clip_feasible_rate": (
+                pooled_clip_feasible_violation_steps / pooled_clip_feasible_steps
+                if pooled_clip_feasible_steps > 0 else math.nan
+            ),
+            "pooled_clip_delta_norm_max": pooled_clip_delta_norm_max,
             "mean_command_correction_norm": mean(float(row["mean_command_correction_norm"]) for row in records),
             "mean_safe_measured_velocity_error_norm": mean(float(row["mean_safe_measured_velocity_error_norm"]) for row in records),
             "mean_policy_inference_batch_ms": mean(float(row["mean_policy_inference_batch_ms"]) for row in records),
@@ -2822,6 +3176,23 @@ def evaluate_method_vectorized(
         print(f"\n[{method} SUMMARY] map={map_name}")
         for key, value in summary.items():
             print(f"  {key}: {value}")
+        if dump_states_path is not None:
+            dump_path = Path(dump_states_path)
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            # main() calls evaluate_method_vectorized once per map, each with
+            # a fresh in-process dumped_states list -- accumulate on disk
+            # across those calls instead of overwriting the previous map's
+            # states, so one --dump-states-path spanning --maps a b c ends
+            # up with all three maps' states, not just the last one.
+            combined_states = list(dumped_states)
+            if dump_path.is_file():
+                combined_states = torch.load(dump_path, weights_only=False) + combined_states
+            torch.save(combined_states, dump_path)
+            n_total = sum(d["ranges"].shape[0] for d in combined_states)
+            print(
+                f"[STATE DUMP] saved {n_total} states across {len(combined_states)} steps "
+                f"(this map added {sum(d['ranges'].shape[0] for d in dumped_states)}) to {dump_path}"
+            )
         return summary_csv
     finally:
         try:
@@ -2906,6 +3277,7 @@ def main() -> None:
         "bcbf_nonlse_cd_qp": args.bcbf_nonlse_cd_qp_checkpoint,
         "cbf_lse_cd_qp_cfmatched": args.cbf_lse_cd_qp_cfmatched_checkpoint,
         "bcbf_lse_cd_qp_cfmatched": args.bcbf_lse_cd_qp_cfmatched_checkpoint,
+        "bcbf_cd_lse_adapted": args.bcbf_cd_lse_adapted_checkpoint,
     }
     for method in args.methods:
         if checkpoints[method] is None:
@@ -2921,24 +3293,18 @@ def main() -> None:
     seed_map_rows: list[dict[str, object]] = []
     seed_aggregate_rows: list[dict[str, object]] = []
 
-    # 2026-09-23: manifests for every seed of a map are now built up front,
-    # then every not-yet-resumed seed's cases are pooled into ONE manifest
-    # per (map, method) before evaluating -- the same "manifests now pooled,
-    # one big batch per map" fix already applied to the CBF-RL eval scripts,
-    # mirrored here. batch_size inside evaluate_method_vectorized is
-    # min(--num-envs, pooled case count), so a sufficiently large --num-envs
-    # (e.g. --num-envs 500 with --num-seeds 25 --cases-per-seed 20) now
-    # processes an entire map's cases in a single batch instead of 25
-    # separate cases-per-seed-sized (20) batches, each previously paying its
-    # own "wait for that batch's slowest straggler" cost. Purely a
-    # wall-clock speedup: scenario content, outcome computation, and the
-    # per-seed seed_X/map/method/method_episodes.csv file layout are all
-    # unchanged, so existing resume behavior and every downstream analysis
-    # script are unaffected. The one behavior change is coarser RNG seeding
-    # (evaluate_method_vectorized seeds once from the pooled manifest's
-    # first case's reset_seed, rather than once per original seed-sized
-    # batch) -- this only affects the exact LiDAR-noise draw sequence, not
-    # scenario content or any statistical property of the results.
+    # Manifests for every seed of a map are built up front, then every
+    # not-yet-resumed seed's cases are pooled into one manifest per
+    # (map, method) before evaluating. batch_size inside
+    # evaluate_method_vectorized is min(--num-envs, pooled case count), so a
+    # sufficiently large --num-envs (e.g. --num-envs 500 with --num-seeds 25
+    # --cases-per-seed 20) processes an entire map's cases in a single batch
+    # instead of one batch per seed, avoiding repeated waits for each batch's
+    # slowest episode. The per-seed seed_X/map/method/method_episodes.csv file
+    # layout is unchanged. evaluate_method_vectorized seeds once from the
+    # pooled manifest's first case's reset_seed, which only affects the exact
+    # LiDAR-noise draw sequence, not scenario content or any statistical
+    # property of the results.
     map_dirs: dict[tuple[str, int], Path] = {}
     pooled_root = root / "_pooled_batches"
     for map_name in args.maps:
@@ -2949,17 +3315,17 @@ def main() -> None:
             print(f"LASER STRUCTURED UNSEEN MAP: {map_name} | EVALUATION SEED: {evaluation_seed}")
             print("=" * 72)
             # A distinctly-named directory when --randomize-start-goal is set:
-            # this new randomized-endpoint scenario bank can never resume from,
-            # or silently overwrite, an existing structured-region manifest
-            # even if pointed at the same --run-root/--output-root.
+            # the randomized-endpoint scenario bank never resumes from, or
+            # overwrites, a structured-region manifest even if pointed at the
+            # same --run-root/--output-root.
             map_dir = seed_dir / (f"{map_name}_random" if args.randomize_start_goal else map_name)
             map_dir.mkdir(parents=True, exist_ok=True)
             # Match the wall_clearance/obstacle_clearance actually enforced by
-            # the simulated environment (see make_laser_config's override) --
-            # using the raw ArenaConfig default (0.15) here let scenarios spawn
-            # as close as 0.25m to a wall/obstacle, which is inside the real
-            # 0.30m margin the env and safety filter assume, and can trigger an
-            # immediate collision/fall at episode start.
+            # the simulated environment (see make_laser_config's override).
+            # The raw ArenaConfig default (0.15) would let scenarios spawn as
+            # close as 0.25 m to a wall/obstacle, inside the 0.30 m margin the
+            # env and safety filter assume, which can trigger an immediate
+            # collision/fall at episode start.
             arena = replace(make_map_arena(map_name), wall_clearance=0.30, obstacle_clearance=0.30)
             write_map_metadata(map_dir, map_name, arena)
             map_index = list(UNSEEN_MAPS).index(map_name)
@@ -3067,7 +3433,7 @@ def main() -> None:
                 collision_termination_mode=args.collision_termination_mode,
                 qp_backend=(
                     args.qp_backend
-                    if method in ("cbf_qp", "cbf_lse_qp", "cbf_lse_cd_qp", "bcbf_qp", "bcbf_lse_cd_qp", "bcbf_nonlse_cd_qp", "cbf_lse_cd_qp_cfmatched", "bcbf_lse_cd_qp_cfmatched")
+                    if method in ("cbf_qp", "cbf_lse_qp", "cbf_lse_cd_qp", "bcbf_qp", "bcbf_lse_cd_qp", "bcbf_nonlse_cd_qp", "cbf_lse_cd_qp_cfmatched", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted")
                     else "active_set"
                 ),
                 terminal_backup_mode=args.terminal_backup_mode,
@@ -3087,6 +3453,26 @@ def main() -> None:
             if args.num_envs != 1:
                 kwargs["num_envs"] = args.num_envs
                 kwargs["dynamic_phase_jitter_s"] = args.dynamic_phase_jitter_s
+                # control_dynamics_a/backup_intent_decay_rate/backup_target_vy/
+                # kappa_scale overrides are vectorized-eval-only
+                # (evaluate_method, the num_envs==1 path, doesn't accept them).
+                kwargs["control_dynamics_a"] = args.control_dynamics_a
+                kwargs["backup_intent_decay_rate"] = args.backup_intent_decay_rate
+                kwargs["backup_target_vy"] = args.backup_target_vy
+                kwargs["kappa_scale"] = args.kappa_scale
+                kwargs["dump_states_path"] = args.dump_states_path
+                kwargs["dump_states_max"] = args.dump_states_max
+            elif (
+                args.control_dynamics_a is not None
+                or args.backup_target_vy is not None
+                or args.kappa_scale is not None
+                or args.dump_states_path is not None
+            ):
+                raise ValueError(
+                    "--control-dynamics-a/--backup-target-vy/--kappa-scale/"
+                    "--dump-states-path require --num-envs > 1 "
+                    "(evaluate_method, the num_envs==1 path, doesn't support them)"
+                )
             evaluator(**kwargs)
             with (pooled_output_dir / f"{method}_episodes.csv").open(newline="") as file:
                 combined_episodes = [dict(row) for row in csv.DictReader(file)]
@@ -3098,9 +3484,8 @@ def main() -> None:
                 method_dir.mkdir(parents=True, exist_ok=True)
                 write_rows(method_dir / f"{method}_episodes.csv", rows)
 
-    # Every (seed, map, method) now has its own episodes.csv on disk --
-    # either pre-existing/resumed, or just written above -- so rebuild the
-    # standard per-seed bookkeeping by reading them back.
+    # Every (seed, map, method) has its own episodes.csv on disk (resumed or
+    # written above); rebuild the per-seed bookkeeping by reading them back.
     for evaluation_seed in evaluation_seeds:
         seed_episodes: list[dict[str, object]] = []
         for map_name in args.maps:
@@ -3132,7 +3517,10 @@ def main() -> None:
                     "timeout_rate", "fall_rate", "outside_rate",
                     "mean_return", "mean_success_path_length_m", "mean_success_goal_time_s",
                     "mean_minimum_clearance_m", "minimum_clearance_overall_m",
-                    "mean_filter_active_fraction", "mean_command_correction_norm"]
+                    "mean_filter_active_fraction", "mean_command_correction_norm",
+                    "pooled_clip_triggered_rate", "pooled_barrier_violated_given_clip_rate",
+                    "pooled_barrier_violated_given_no_clip_rate",
+                    "pooled_barrier_violated_given_clip_feasible_rate", "pooled_clip_delta_norm_max"]
     def across_seed(rows: list[dict[str, object]], **labels: object) -> dict[str, object]:
         result: dict[str, object] = dict(labels)
         result["num_seeds"] = len(rows)
@@ -3187,7 +3575,7 @@ def main() -> None:
     write_rows(root / "across_seed_summary_aggregate.csv", across_aggregate_rows)
     write_rows(root / "paired_method_comparisons_by_map.csv", paired_map_rows)
     write_rows(root / "paired_method_comparisons_aggregate.csv", paired_aggregate_rows)
-    # Backward-compatible names now point to the statistically richer pooled summaries.
+    # Summary files under the standard names hold the pooled summaries.
     combined_path = root / "combined_summary_by_map.csv"
     aggregate_path = root / "aggregate_summary.csv"
     write_rows(combined_path, pooled_map_rows)

@@ -6,15 +6,13 @@ from typing import Any
 import torch
 
 try:
-    # Local repo state: this file lives under SAFTER_src/, and imports its
-    # own sibling high_level_rl package from there too.
+    # Package layout used by this repository (SAFTER_src.*).
     from SAFTER_src.high_level_rl.laser_cbf_filters import build_invariant_ellipse_bcbf_filter
     from SAFTER_src.high_level_rl.math_utils import world_to_body
     from SAFTER_src.high_level_rl.navigation_env import HighLevelNavigationEnv
     from SAFTER_src.high_level_rl.raycast_patterns import horizontal_ray_angles
 except ModuleNotFoundError:
-    # Server state: this same file is deployed at src/high_level_laser_sac/
-    # (the original, pre-rename location) -- fall back to src.high_level_rl.
+    # Fall back to the src.* layout when this file is deployed under src/.
     from src.high_level_rl.laser_cbf_filters import build_invariant_ellipse_bcbf_filter
     from src.high_level_rl.math_utils import world_to_body
     from src.high_level_rl.navigation_env import HighLevelNavigationEnv
@@ -161,9 +159,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
             )
             # Keep scenario poses on the simulation device.  Constructing a
             # fresh CUDA tensor from each Python tuple during every reset is
-            # both needlessly synchronous and has produced intermittent
-            # ``Expected a CUDA device, but got cpu:0`` failures with recent
-            # PyTorch/CUDA builds.
+            # needlessly synchronous.
             self._scenario_starts = torch.tensor(
                 [s.start_xy for s in scenarios], dtype=torch.float32, device=map_device
             )
@@ -221,7 +217,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
                 for name in self._procedural_map_entity_names
             )
 
-        # --- Reset-time h_aug(z0) feasibility guard (Task 8, 2026-09 fix).
+        # --- Reset-time h_aug(z0) feasibility guard.
         # Built BEFORE super().__init__(), which itself calls self.reset() and
         # therefore _reset_selected() before returning control here. A
         # procedurally-sampled scenario must satisfy the SAME invariant-
@@ -616,7 +612,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
                 f"= {ratio}"
             )
         # Number of high-level steps between real LiDAR reads. 1 when
-        # laser.update_dt == navigation.high_level_dt (the archived/default
+        # laser.update_dt == navigation.high_level_dt (the default
         # 10 Hz-everywhere behavior); >1 decouples a slower sensor from a
         # faster decision loop (see _maybe_refresh_laser_cache).
         self._laser_refresh_every_n_steps = rounded_ratio
@@ -823,12 +819,12 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         return self.ray_angles.to(device=ranges.device, dtype=ranges.dtype)
 
     def _enforce_reset_feasibility(self, env_ids: torch.Tensor) -> None:
-        """Reject/resample any candidate scenario with h_aug(z0) < 0 (Task 8).
+        """Reject/resample any candidate scenario with h_aug(z0) < 0.
 
         Does NOT modify h_aug, the terminal scales, or any theorem constant --
         only which scenario a given env slot ends up running. Exhausting the
         attempt budget raises rather than silently accepting an infeasible
-        start, per spec.
+        start.
         """
         remaining = env_ids
         for _ in range(self.reset_feasibility_max_attempts):
@@ -1125,7 +1121,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         # Advance the LiDAR refresh cadence exactly once per high-level step,
         # before anything in this step reads laser_ranges(). With the
         # default laser.update_dt == navigation.high_level_dt this refreshes
-        # every call (unchanged archived behavior); with a slower
+        # every call; with a slower
         # update_dt it lets high_level_dt run faster than the sensor's own
         # native refresh rate without every intervening step re-sampling it.
         self._maybe_refresh_laser_cache()
@@ -1146,12 +1142,12 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         maximum_body_contact_force = torch.zeros(
             self.num_envs, dtype=safe.dtype, device=self.device
         )
-        # The contact sensors (and the seanav_contact termination path below)
+        # The contact sensors (and the direct_contact termination path below)
         # are the only consumers of this per-substep force readout. Skipping
         # it in "circle" mode avoids querying sensors that were never added
         # to the scene, and avoids paying their contact-kernel cost on every
         # substep for a value that circle mode discards.
-        use_contact_sensors = self.contact_collision_cfg.termination_mode == "seanav_contact"
+        use_contact_sensors = self.contact_collision_cfg.termination_mode == "direct_contact"
 
         for _ in range(cfg.low_steps_per_high_step):
             if hasattr(self.command_interface, "write_batch"):
@@ -1200,8 +1196,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         if self._any_square_slot and geometry.collision_geometry != "circle":
             # Box-vs-ellipse Minkowski overlap is not implemented; a square
             # slot's collision math below always assumes a circular robot
-            # footprint (collision_circle_radius_m), same as legacy all-square
-            # banks required.
+            # footprint (collision_circle_radius_m).
             raise ValueError(
                 "Any square obstacle slot currently requires --collision-geometry circle"
             )
@@ -1250,8 +1245,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         )
         obstacle_collision = torch.any(collision_h_obs <= 0.0, dim=-1)
         # Physical wall contact is detected by the contact sensors. This exact
-        # center-bound test is only a numerical escape guard, without the old
-        # arbitrary circle/ellipse inset.
+        # center-bound test is only a numerical escape guard.
         outside = (
             (p[:, 0] <= cfg.arena.x_min)
             | (p[:, 0] >= cfg.arena.x_max)
@@ -1260,12 +1254,12 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         )
         termination_mode = self.contact_collision_cfg.termination_mode
         if termination_mode == "circle":
-            # Archived SAC behavior: the configured circular robot footprint
+            # SAC behavior: the configured circular robot footprint
             # terminates when it overlaps an obstacle proxy. Physical contacts
             # remain available in diagnostics but do not define reward or done.
             collision = obstacle_collision | outside
             collision_reward_event = collision
-        elif termination_mode == "seanav_contact":
+        elif termination_mode == "direct_contact":
             # Simulator-native SEA-Nav-inspired behavior. This is intentionally
             # named "inspired": MuJoCo and Isaac Gym expose different contact
             # models and the high-level policy only resets at 10 Hz.
@@ -1297,7 +1291,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
                 self.collision_initialization_early_resets += int(early_collision_reset.sum())
         self._last_collision_active.copy_(collision_reward_event)
         # For lifted CBF/bCBF variants, h_lse additionally composes command-
-        # input barriers.  The safety reward/diagnostic requested here must be
+        # input barriers.  The safety reward/diagnostic must be
         # LiDAR-derived only, so use the ray/backup aggregate exposed as
         # h_backup_lse. Direct CBF already exposes its ray aggregate as h_lse.
         laser_h_lse = getattr(safety, "h_backup_lse", None)
@@ -1372,7 +1366,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         r = self.sac_reward_cfg
         # See LaserRewardConfig.reference_dt: keeps each per-step shaping
         # term's *per-second* contribution approximately constant across
-        # different high_level_dt settings. 1.0 at the archived default
+        # different high_level_dt settings. 1.0 at the default
         # (high_level_dt == reference_dt), so this is a no-op there.
         dt_scale = float(cfg.high_level_dt) / float(r.reference_dt)
         components = {
@@ -1385,8 +1379,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
             "cbf_correction": -(dt_scale * r.cbf_correction_weight) * normalized_correction,
         }
         if r.profile == "original":
-            # Archived v5 reward path. Keep it byte-for-byte equivalent in
-            # meaning for all existing launch commands and checkpoints.
+            # Original reward profile.
             components.update({
                 "goal": r.goal_bonus * goal.float(),
                 "timeout": -r.timeout_penalty * truncated.float(),
@@ -1447,8 +1440,8 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         # Wall contact is a collision outcome; keep this legacy field false so
         # pooled outcome rates remain mutually exclusive.
         outcome_outside = torch.zeros_like(outcome_collision)
-        # Retain legacy detail fields in extras for old analysis/checkpoint
-        # consumers, but do not expose them as separate training metrics.
+        # Keep detail fields in extras for analysis consumers, but do not
+        # expose them as separate training metrics.
         outcome_fallen = fallen & ~outcome_success
         # A time-limit flag can coincide with another terminal event on the
         # final control step.  Preserve the documented priority ordering so
@@ -1487,10 +1480,10 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
         h_input = getattr(safety, "h_input_lse", None)
         lambda_value = getattr(safety, "lambda_value", None)
         # Distinct name from the `input_bound_violation` computed earlier for
-        # `extras["completed_input_bound_violation"]` below -- reusing that
-        # name here previously shadowed the already-None-defaulted value with
-        # a fresh, unguarded read, breaking any method (e.g. SEA-Nav) whose
-        # safety result leaves this field unset.
+        # `extras["completed_input_bound_violation"]` below -- that earlier
+        # value is None-defaulted, while this read is unguarded, so reusing
+        # the name would break any method (e.g. SEA-Nav) whose safety result
+        # leaves this field unset.
         log_input_bound_violation = getattr(safety, "input_bound_violation", None)
         if h_backup is not None:
             log_values["h_backup_lse"] = h_backup.mean().detach()
@@ -1519,7 +1512,7 @@ class LaserSacNavigationEnv(HighLevelNavigationEnv):
             "completed_hard_body_contact": hard_body_contact[completed_ids].detach().clone(),
             "completed_maximum_body_contact_force_n": maximum_body_contact_force[completed_ids].detach().clone(),
             "completed_laser_safety_violation": outcome_safety_violation[completed_ids].detach().clone(),
-            # Compatibility aliases for existing analysis scripts/checkpoints.
+            # Compatibility aliases for analysis scripts.
             "completed_safety_violation": outcome_safety_violation[completed_ids].detach().clone(),
             "completed_raw_safety_violation": outcome_safety_violation[completed_ids].detach().clone(),
             "completed_timeouts": outcome_timeout[completed_ids].detach().clone(),

@@ -76,10 +76,20 @@ class TrainLaserSacConfig:
     safety_clearance: float = 0.30
     collision_geometry: CollisionGeometry = "ellipse"
     collision_circle_radius_m: float = 0.30
-    collision_termination_mode: CollisionTerminationMode = "seanav_contact"
+    collision_termination_mode: CollisionTerminationMode = "direct_contact"
     collision_margin_m: float = 0.05
     hard_clip_output: bool = True
     qp_backend: QpBackend = "active_set"
+    # bcbf_cf-only "sidestep-then-stop" backup controller (ignored by every
+    # other method). backup_target_vy=0 (default) reproduces the original
+    # zero-backup ("coast to a dead stop") controller bit-for-bit. Nonzero
+    # backup_target_vy makes the backup policy transiently sidestep by that
+    # amount before its own intent fades (rate backup_intent_decay_rate) and
+    # the backup trajectory settles back to rest -- the terminal sets are the
+    # same as for the zero-backup controller. See
+    # SafetyConfig.backup_target_command.
+    backup_target_vy: float = 0.0
+    backup_intent_decay_rate: float = 2.0
     # Original three-hidden-layer SAC MLP. Capacity ablations can override this
     # with a comma-separated CLI value.
     # Comma-separated because the task launcher performs two-stage CLI parsing;
@@ -108,8 +118,8 @@ class TrainLaserSacConfig:
     collision_undo_time_min_s: float = 2.0
     collision_undo_time_max_s: float = 3.0
     config: LaserSacConfig = field(default_factory=LaserSacConfig)
-    # The default deliberately preserves the archived v5 behavior. Only the
-    # dedicated SEA-Nav launcher overrides this field.
+    # The default is the standard training profile; only the dedicated
+    # SEA-Nav launcher overrides this field.
     training_profile: Literal[
         "original", "seanav_comparable_10hz", "seanav_comparable_50hz"
     ] = "original"
@@ -271,7 +281,7 @@ def add_navigation_laser_sensor(env_cfg, cfg: LaserSacConfig) -> None:
         ),
     )
     extra_sensors: tuple = ()
-    if contact.termination_mode == "seanav_contact":
+    if contact.termination_mode == "direct_contact":
         # These two contact sensors add real per-substep MuJoCo/mjWarp
         # contact-kernel cost, and step_safe()'s per-substep force readout is
         # their only consumer. "circle" mode never reads them, so skip
@@ -383,10 +393,10 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
             "--collision-termination-mode circle requires "
             "--collision-geometry circle"
         )
-    if cfg.enable_collision_initialization and cfg.collision_termination_mode != "seanav_contact":
+    if cfg.enable_collision_initialization and cfg.collision_termination_mode != "direct_contact":
         raise ValueError(
             "SEA-Nav-inspired collision initialization requires "
-            "--collision-termination-mode seanav_contact"
+            "--collision-termination-mode direct_contact"
         )
     if not (0.0 <= cfg.collision_initialization_probability <= 1.0):
         raise ValueError("--collision-initialization-probability must be in [0, 1]")
@@ -410,8 +420,8 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
         fov_deg=float(cfg.laser_fov_deg),
         max_range=float(cfg.laser_max_range),
     )
-    # Preserve the historical CLI meaning: --safety-clearance is the desired
-    # front-ray threshold measured from the LiDAR origin.  Convert it to the
+    # --safety-clearance is the desired front-ray threshold measured from the
+    # LiDAR origin.  Convert it to the
     # additional body-footprint margin used by the local point-geometry CBF.
     base_safety = cfg.config.safety
     front_body_distance = max(
@@ -428,6 +438,8 @@ def run(task_id: str, cfg: TrainLaserSacConfig) -> None:
         collision_margin_m=float(cfg.collision_margin_m),
         hard_clip_output=bool(cfg.hard_clip_output),
         qp_backend=cfg.qp_backend,
+        backup_target_command=(0.0, float(cfg.backup_target_vy), 0.0),
+        backup_intent_decay_rate=float(cfg.backup_intent_decay_rate),
     )
     arena_template = procedural_maps[0].arena
     empty_arena_template = replace(arena_template, obstacles=())

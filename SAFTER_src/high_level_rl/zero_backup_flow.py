@@ -146,3 +146,150 @@ def exact_zero_backup_state_and_phi(
     phi_t[:, :, 5, 5] = decay_t[None, :, 2]
 
     return z_t, phi_t
+
+
+def exact_decaying_target_backup_state_and_phi(
+    z0: torch.Tensor,
+    times: torch.Tensor,
+    a: torch.Tensor,
+    u_target0: torch.Tensor,
+    intent_decay_rate: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact backup flow/Jacobian for a "sidestep-then-stop" backup policy.
+
+    Generalizes ``exact_zero_backup_state_and_phi`` (coast to a dead stop,
+    ``u_dot = -A u``) to a backup controller whose own commanded intent
+    ``u_target(t) = u_target0 * exp(-b t)`` decays to zero as t grows, i.e.
+
+        u_dot = -A (u - u_target(t)),   u_target(t) = u_target0 exp(-b t).
+
+    Unlike a constant nonzero backup target, this converges to rest as
+    t -> infinity (both exponential terms vanish), so it reaches the SAME
+    zero-velocity equilibrium the zero-backup flow does. This is what lets it
+    reuse the existing terminal-set derivations (``legacy_inflated_ellipse``,
+    ``invariant_ellipse``) unchanged: both assume near-zero residual velocity
+    at the terminal sample time, and with ``intent_decay_rate`` large enough
+    relative to ``1/backup_horizon_s`` the residual commanded intent at the
+    terminal time is exponentially negligible (e.g. b=2, horizon=4s gives
+    exp(-8) ~ 3e-4 of the original intent). u_target0=0 reproduces the zero
+    backup flow bit-for-bit (the correction terms below are exactly 0 either
+    way). Linear ODE solution per axis i (for a_i != b):
+
+        u_i(t) = (u0_i - C_i) exp(-a_i t) + C_i exp(-b t),
+        C_i = a_i u_target0_i / (a_i - b).
+
+    Args:
+        z0: ``(B, 6)`` initial augmented state ``[x, y, yaw, vx, vy, wz]``.
+        times: ``(K,)`` absolute rollout times, each measured from tau=0.
+        a: ``(3,)`` command decay rates.
+        u_target0: ``(3,)`` initial backup intent ``[vx, vy, wz]`` that decays
+            away, in the same frame as ``z0``'s command block.
+        intent_decay_rate: scalar tensor ``b`` > 0, the rate at which the
+            backup intent itself fades. Must not equal any entry of ``a``
+            (checked by the caller) to avoid the resonant a_i == b case.
+
+    Returns:
+        z_t: ``(B, K, 6)`` state at each requested time.
+        phi_t: ``(B, K, 6, 6)`` Jacobian ``d z_t / d z0``.
+    """
+    device, dtype = z0.device, z0.dtype
+    batch = z0.shape[0]
+    num_times = times.shape[0]
+
+    p0 = z0[:, :2]
+    yaw0 = z0[:, 2]
+    u0 = z0[:, 3:]
+    vx0, vy0, wz0 = u0[:, 0], u0[:, 1], u0[:, 2]
+
+    ax, ay, awz = a[0], a[1], a[2]
+    b = intent_decay_rate
+    big_c = a * u_target0 / (a - b)  # (3,)
+    cx, cy, cwz = big_c[0], big_c[1], big_c[2]
+
+    decay_t = torch.exp(-a[None, :] * times[:, None])  # (K, 3)
+    decay_b_t = torch.exp(-b * times)  # (K,)
+    u_t = (
+        (u0[:, None, :] - big_c[None, None, :]) * decay_t[None, :, :]
+        + big_c[None, None, :] * decay_b_t[None, :, None]
+    )  # (B, K, 3)
+
+    c2_awz_t = (1.0 - torch.exp(-awz * times)) / awz  # (K,)
+    c2_b_t = (1.0 - torch.exp(-b * times)) / b  # (K,)
+    yaw_t = (
+        yaw0[:, None]
+        + (u0[:, 2:3] - cwz) * c2_awz_t[None, :]
+        + cwz * c2_b_t[None, :]
+    )  # (B, K)
+
+    nodes = torch.tensor(_GL8_NODES, device=device, dtype=dtype)
+    weights = torch.tensor(_GL8_WEIGHTS, device=device, dtype=dtype)
+
+    tau = 0.5 * times[:, None] * (nodes[None, :] + 1.0)  # (K, 8)
+    quad_w = (0.5 * times[:, None] * weights[None, :])[None, :, :]  # (1, K, 8)
+
+    exp_ax_tau = torch.exp(-ax * tau)[None, :, :]  # (1, K, 8)
+    exp_ay_tau = torch.exp(-ay * tau)[None, :, :]
+    exp_b_tau = torch.exp(-b * tau)[None, :, :]
+    c2_awz_tau = ((1.0 - torch.exp(-awz * tau)) / awz)[None, :, :]  # (1, K, 8)
+    c2_b_tau = ((1.0 - torch.exp(-b * tau)) / b)[None, :, :]  # (1, K, 8)
+
+    vx_tau = (vx0[:, None, None] - cx) * exp_ax_tau + cx * exp_b_tau  # (B, K, 8)
+    vy_tau = (vy0[:, None, None] - cy) * exp_ay_tau + cy * exp_b_tau
+    yaw_tau = (
+        yaw0[:, None, None]
+        + (wz0[:, None, None] - cwz) * c2_awz_tau
+        + cwz * c2_b_tau
+    )  # (B, K, 8)
+
+    c = torch.cos(yaw_tau)
+    s = torch.sin(yaw_tau)
+    x_dot = c * vx_tau - s * vy_tau
+    y_dot = s * vx_tau + c * vy_tau
+
+    delta_px = torch.sum(quad_w * x_dot, dim=-1)  # (B, K)
+    delta_py = torch.sum(quad_w * y_dot, dim=-1)
+    p_t = p0[:, None, :] + torch.stack((delta_px, delta_py), dim=-1)  # (B, K, 2)
+
+    z_t = torch.cat((p_t, yaw_t[..., None], u_t), dim=-1)  # (B, K, 6)
+
+    # --- Exact Jacobian of the quadrature-based flow map, w.r.t. z0 ---
+    # u_target0 and intent_decay_rate are z0-independent constants, so every
+    # partial derivative below has the identical FORM to the zero-target case
+    # (see exact_zero_backup_state_and_phi); only the vx_tau/vy_tau/yaw_tau
+    # values they are evaluated at have shifted.
+    dxdot_dyaw0 = -s * vx_tau - c * vy_tau
+    dydot_dyaw0 = c * vx_tau - s * vy_tau
+    dxdot_dwz0 = dxdot_dyaw0 * c2_awz_tau
+    dydot_dwz0 = dydot_dyaw0 * c2_awz_tau
+    dxdot_dvx0 = c * exp_ax_tau
+    dydot_dvx0 = s * exp_ax_tau
+    dxdot_dvy0 = -s * exp_ay_tau
+    dydot_dvy0 = c * exp_ay_tau
+
+    dpx_dyaw0 = torch.sum(quad_w * dxdot_dyaw0, dim=-1)  # (B, K)
+    dpy_dyaw0 = torch.sum(quad_w * dydot_dyaw0, dim=-1)
+    dpx_dvx0 = torch.sum(quad_w * dxdot_dvx0, dim=-1)
+    dpy_dvx0 = torch.sum(quad_w * dydot_dvx0, dim=-1)
+    dpx_dvy0 = torch.sum(quad_w * dxdot_dvy0, dim=-1)
+    dpy_dvy0 = torch.sum(quad_w * dydot_dvy0, dim=-1)
+    dpx_dwz0 = torch.sum(quad_w * dxdot_dwz0, dim=-1)
+    dpy_dwz0 = torch.sum(quad_w * dydot_dwz0, dim=-1)
+
+    phi_t = torch.zeros(batch, num_times, 6, 6, device=device, dtype=dtype)
+    phi_t[:, :, 0, 0] = 1.0
+    phi_t[:, :, 1, 1] = 1.0
+    phi_t[:, :, 0, 2] = dpx_dyaw0
+    phi_t[:, :, 1, 2] = dpy_dyaw0
+    phi_t[:, :, 0, 3] = dpx_dvx0
+    phi_t[:, :, 1, 3] = dpy_dvx0
+    phi_t[:, :, 0, 4] = dpx_dvy0
+    phi_t[:, :, 1, 4] = dpy_dvy0
+    phi_t[:, :, 0, 5] = dpx_dwz0
+    phi_t[:, :, 1, 5] = dpy_dwz0
+    phi_t[:, :, 2, 2] = 1.0
+    phi_t[:, :, 2, 5] = c2_awz_t[None, :]
+    phi_t[:, :, 3, 3] = decay_t[None, :, 0]
+    phi_t[:, :, 4, 4] = decay_t[None, :, 1]
+    phi_t[:, :, 5, 5] = decay_t[None, :, 2]
+
+    return z_t, phi_t

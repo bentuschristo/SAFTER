@@ -8,18 +8,13 @@ in one script.
 
 --nominal-source {heuristic, sac} selects the nominal policy:
     heuristic: BatchedGoToGoalController, an obstacle-blind P controller.
-               Always the legacy/stateless call (its output IS the
-               instantaneously-applied body velocity, clipped to
-               HEURISTIC_MIN_CMD/MAX_CMD) -- the ONLY heuristic mode this
-               script supports, on every map source, so results are
-               comparable across them. An earlier revision of the
-               structured-map path additionally supported a stateful
-               acceleration-integrator mode (velocity as an uncapped
-               integrator state, per Rabiee & Hoagg Example 3); that mode
-               produced wildly different (unbounded, windup-prone) nominal
-               commands purely as an artifact of which script ran the
-               evaluation, not of the safety filter under test, so it has
-               been removed entirely.
+               Stateless: its output IS the instantaneously-applied body
+               velocity, clipped to HEURISTIC_MIN_CMD/MAX_CMD. This is the
+               only heuristic mode supported, on every map source, so
+               results are comparable across them. No stateful
+               (acceleration-integrator) variant is provided: its uncapped
+               velocity state would make the nominal commands depend on
+               the script rather than on the safety filter under test.
     sac:       the raw nominal command from a trained (no-filter) SAC
                checkpoint passed via --vanilla-checkpoint. Supported on
                both map sources; on --map-source structured the laser is
@@ -806,6 +801,10 @@ def main() -> None:
             action_max_wz=ACTION_LIMITS[2],
             backup_margin=args.backup_margin,
             low_checkpoint=args.low_level_checkpoint,
+            # Matches build_structured_environment's convention: a SAC checkpoint's
+            # saved laser config has noise enabled, so only the sac nominal source
+            # needs it; the heuristic nominal source stays deterministic.
+            enable_lidar_noise=(args.nominal_source == "sac"),
         )
         try:
             result = evaluate(

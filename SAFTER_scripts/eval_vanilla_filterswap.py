@@ -5,28 +5,27 @@ high-speed checkpoint (max_vx=2.0, min_vx=-1.0, max_vy=1.0, max_wz=1.0,
 360 deg/120-ray LiDAR, 10Hz high-level/50Hz low-level, handcrafted2) -- and
 retrofit EITHER SAFTER (LaserZeroBackupLseCbfClosedForm) or the no-CD
 bCBF-LSE-QP (LaserZeroBackupLseQp) onto it at evaluation time, on the three
-current structured maps (low_shift/medium_shift/high_shift).
+structured maps (low_shift/medium_shift/high_shift).
 
 This answers: how much does each filter actually correct a policy that
 never trained with a safety filter at all, compared to the obstacle-blind
-analytic heuristic controller used in eval_heuristic_safter.py /
-eval_heuristic_hardbox_nocd.py? The vanilla policy at least has LiDAR in
+analytic heuristic controller used in eval_heuristic_vs_sac.py
+(--nominal-source heuristic)? The vanilla policy at least has LiDAR in
 its observation (even though nothing forced it to use that information
 safely), unlike the pure P-controller.
 
 Reuses build_environment/load_actor/timed_deterministic_actor/
-row_to_scenario/manifest machinery from the structured eval driver (same
-as eval_heuristic_safter.py and evaluate_ablation_filter_swap.py), and the
+row_to_scenario/manifest machinery from the structured eval driver, and the
 retrofit-filter-construction pattern from evaluate_ablation_filter_swap.py
 (extended here with a "bcbf_lse_qp" branch for the no-CD filter, which
 that script doesn't support).
 
-CSV schema matches the other eval_heuristic_*.py scripts; method name is
+CSV schema matches eval_heuristic_vs_sac.py; method name is
 "vanilla_nominal_<filter-type>" (e.g. "vanilla_nominal_safter",
 "vanilla_nominal_bcbf_lse_qp"). With --log-trajectories, also writes a
 per-step "<method_name>_trajectory.csv" (position/yaw history against the
 map, plus nominal/safe control-input history) alongside the episodes and
-summary CSVs, same schema as eval_heuristic_safter.py's trajectory CSV.
+summary CSVs, same schema as eval_heuristic_vs_sac.py's trajectory CSV.
 """
 from __future__ import annotations
 
@@ -35,6 +34,7 @@ import csv
 import gc
 import math
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from statistics import mean
@@ -44,8 +44,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# warp.init() before anything else: see eval_heuristic_hardbox_nocd.py's own
-# comment for the full explanation of why this ordering avoids a segfault.
+# warp.init() must run before anything transitively imports mjlab.entity
+# (avoids a segfault at import time).
 import warp as wp  # noqa: E402
 
 wp.init()
@@ -64,6 +64,7 @@ from SAFTER_src.high_level_rl.laser_cbf_filters import (  # noqa: E402
 from SAFTER_scripts.laser_unseen_eval.evaluate_laser_unseen_maps_structured import (  # noqa: E402
     UNSEEN_MAPS,
     STRUCTURED_SCENARIO_REGIONS,
+    _device_synchronize,
     build_environment,
     generate_manifest,
     load_actor,
@@ -82,10 +83,9 @@ from SAFTER_scripts.laser_unseen_eval.evaluate_laser_unseen_maps_structured impo
 
 TASK_ID = "Unitree-Go2-Safe-Navigation"
 DEFAULT_LOW_CHECKPOINT = "logs/rsl_rl/go2_velocity/2026-06-19_13-24-10/model_10000.pt"
-# The specific asymmetric high-speed vanilla checkpoint (360 FOV/120 rays,
+# The asymmetric-limit high-speed vanilla checkpoint (360 FOV/120 rays,
 # 10Hz/50Hz, handcrafted2, max_vx=2.0/min_vx=-1.0/max_vy=1.0/max_wz=1.0,
-# target_vector_steps=80000) identified as "the nominal asymmetrical limit
-# high-speed vanilla SAC policy."
+# target_vector_steps=80000).
 DEFAULT_VANILLA_CHECKPOINT = (
     "logs/sac_laser/go2_safe_navigation_sac_laser_vanilla/"
     "2026-09-14_00-25-56_vanilla_10hz_seaspeed_seed0/model_step_80000.pt"
@@ -283,14 +283,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vanilla-checkpoint", default=DEFAULT_VANILLA_CHECKPOINT)
     parser.add_argument("--low-level-checkpoint", default=DEFAULT_LOW_CHECKPOINT)
     # Matches the vanilla checkpoint's own trained configuration exactly
-    # (see logs/sac_laser/.../vanilla/2026-09-14_00-25-56_.../model_step_80000.pt's
-    # saved config) -- load_actor() strictly checks laser/safety against this.
+    # (its saved config) -- load_actor() strictly checks laser/safety
+    # against this.
     parser.add_argument("--laser-num-rays", type=int, default=120)
     parser.add_argument("--laser-fov-deg", type=float, default=360.0)
     parser.add_argument("--collision-geometry", choices=("circle", "ellipse"), default="circle")
     parser.add_argument("--collision-circle-radius-m", type=float, default=0.30)
     parser.add_argument("--collision-margin-m", type=float, default=0.05)
-    parser.add_argument("--collision-termination-mode", choices=("circle", "seanav_contact"), default="circle")
+    parser.add_argument("--collision-termination-mode", choices=("circle", "direct_contact"), default="circle")
     parser.add_argument("--backup-margin", type=float, default=0.6)
     parser.add_argument("--min-endpoint-clearance", type=float, default=0.10)
     parser.add_argument("--block-margin", type=float, default=0.10)
@@ -452,6 +452,9 @@ def evaluate_map(
             residual_exec_mins = [math.inf] * active_count
             returns = [0.0] * active_count
             step_counts = [0] * active_count
+            policy_ms_sums = [0.0] * active_count
+            filter_ms_sums = [0.0] * active_count
+            total_ms_sums = [0.0] * active_count
 
             with torch.no_grad():
                 while not all(finished):
@@ -460,24 +463,48 @@ def evaluate_map(
                     # manual position/yaw query.
                     _, pre_yaws = env.safety_context()
                     actor_obs = env.actor_tensor(obs)
-                    nominal, _safe, safety, _, _, _ = timed_deterministic_actor(actor, actor_obs)
+                    # policy_ms times only the MLP backbone + tanh (see
+                    # timed_deterministic_actor); the actor's own native
+                    # apply_safety() call inside it runs unavoidably but is
+                    # excluded from this window, so policy_ms stays a clean
+                    # "pure policy forward pass" number. The discarded
+                    # _native_filter_ms/_native_total_ms below time that
+                    # unused native filter call, not the retrofit filter
+                    # actually being evaluated -- that one is timed
+                    # separately as filter_ms right below.
+                    nominal, _safe, safety, policy_ms, _native_filter_ms, _native_total_ms = (
+                        timed_deterministic_actor(actor, actor_obs)
+                    )
 
                     ranges = actor._ranges(actor_obs)
                     angles = actor.ray_angles.to(device=actor_obs.device, dtype=actor_obs.dtype)
+                    _device_synchronize(actor_obs.device)
+                    filter_start_ns = time.perf_counter_ns()
                     if filter_type in (
                         "safter", "bcbf_lse_cd_qp", "bcbf_lse_cd_qp_cfmatched", "bcbf_cd_lse_adapted",
                     ):
-                        # Both are control-dynamics (velocity-as-state)
+                        # All four are control-dynamics (velocity-as-state)
                         # filters -- they need the env's own tracked
-                        # current-command/previous-nominal-command/history-
-                        # valid observation slices, same as SAFTER's own
-                        # actor uses internally. Only the no-CD bcbf_lse_qp
-                        # filter below has no such state to feed.
+                        # previous-nominal-command/history-valid observation
+                        # slices, same as SAFTER's own actor uses internally.
+                        # bcbf_cd_lse_adapted alone takes measured body
+                        # velocity (actor_obs[:, 2:5]) as its state, rather
+                        # than the previously executed command
+                        # (actor_obs[:, 5:8]) the other three use -- see
+                        # LaserZeroBackupCdLseAdapted's docstring. Only the
+                        # no-CD bcbf_lse_qp filter below has no such state
+                        # to feed.
+                        command_state = (
+                            actor_obs[:, 2:5] if filter_type == "bcbf_cd_lse_adapted" else actor_obs[:, 5:8]
+                        )
                         retrofit = retrofit_filter.filter(
-                            ranges, angles, actor_obs[:, 5:8], nominal, actor_obs[:, -4:-1], actor_obs[:, -1:],
+                            ranges, angles, command_state, nominal, actor_obs[:, -4:-1], actor_obs[:, -1:],
                         )
                     else:
                         retrofit = retrofit_filter.filter(ranges, angles, None, nominal, None, None)
+                    _device_synchronize(actor_obs.device)
+                    filter_ms = (time.perf_counter_ns() - filter_start_ns) / 1.0e6
+                    total_ms = policy_ms + filter_ms
                     applied = retrofit.command
                     if actor.hard_clip_output:
                         applied = torch.clamp(applied, actor.action_low, actor.action_high)
@@ -496,6 +523,9 @@ def evaluate_map(
                         if finished[env_id]:
                             continue
                         step_counts[env_id] += 1
+                        policy_ms_sums[env_id] += policy_ms
+                        filter_ms_sums[env_id] += filter_ms
+                        total_ms_sums[env_id] += total_ms
                         step_reward = float(reward[env_id].detach().cpu())
                         returns[env_id] += step_reward
                         completed_row = completed_lookup.get(env_id)
@@ -519,7 +549,7 @@ def evaluate_map(
                         filter_active = correction_value > 1e-8
                         active_steps[env_id] += int(filter_active)
 
-                        # Reviewer diagnostic: how often the retrofit filter's
+                        # Diagnostic: how often the retrofit filter's
                         # own hard clip changes the command, and whether the
                         # as-executed command (`retrofit.command`, matching
                         # `applied` here since action_limits are identical)
@@ -569,6 +599,10 @@ def evaluate_map(
                                 "safe_vx_mps": float(applied[env_id, 0].detach().cpu()),
                                 "safe_vy_mps": float(applied[env_id, 1].detach().cpu()),
                                 "safe_wz_radps": float(applied[env_id, 2].detach().cpu()),
+                                "policy_inference_batch_ms": policy_ms,
+                                "safety_filter_batch_ms": filter_ms,
+                                "total_actor_inference_batch_ms": total_ms,
+                                "total_actor_inference_amortized_per_env_ms": total_ms / active_count,
                                 "command_correction_norm": correction_value,
                                 "clip_delta_m_s": (
                                     float(clip_delta_flags[env_id].detach().cpu())
@@ -642,6 +676,14 @@ def evaluate_map(
                                 "min_residual_exec": (
                                     residual_exec_mins[env_id] if math.isfinite(residual_exec_mins[env_id]) else math.nan
                                 ),
+                                "mean_policy_inference_batch_ms": policy_ms_sums[env_id] / max(step_counts[env_id], 1),
+                                "mean_safety_filter_batch_ms": filter_ms_sums[env_id] / max(step_counts[env_id], 1),
+                                "mean_total_actor_inference_batch_ms": (
+                                    total_ms_sums[env_id] / max(step_counts[env_id], 1)
+                                ),
+                                "mean_total_actor_inference_amortized_per_env_ms": (
+                                    total_ms_sums[env_id] / max(step_counts[env_id], 1) / active_count
+                                ),
                             })
                             finished[env_id] = True
                             completed_total = batch_start + sum(finished)
@@ -695,6 +737,14 @@ def evaluate_map(
             ),
             "pooled_barrier_violated_given_no_clip_rate": (
                 pooled_no_clip_violation_steps / max(pooled_diag_steps - pooled_clip_steps, 1)
+            ),
+            "mean_policy_inference_batch_ms": mean(float(r["mean_policy_inference_batch_ms"]) for r in records),
+            "mean_safety_filter_batch_ms": mean(float(r["mean_safety_filter_batch_ms"]) for r in records),
+            "mean_total_actor_inference_batch_ms": mean(
+                float(r["mean_total_actor_inference_batch_ms"]) for r in records
+            ),
+            "mean_total_actor_inference_amortized_per_env_ms": mean(
+                float(r["mean_total_actor_inference_amortized_per_env_ms"]) for r in records
             ),
         }
         return {"records": records, "trajectory_records": trajectory_records, "summary": summary}

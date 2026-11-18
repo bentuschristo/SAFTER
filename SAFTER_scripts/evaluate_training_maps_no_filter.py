@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the latest SAC policies (vanilla/cbf_cd_cf/bcbf_cf) on the actual
+"""Evaluate SAC policies (vanilla/cbf_cd_cf/bcbf_cf) on the actual
 TRAINING procedural map bank (handcrafted2: 5 maps x 200 scenarios each),
 with the safety filter DISABLED at runtime.
 
@@ -22,8 +22,7 @@ sampling and the reset-time feasibility resampler), so re-running this
 script reproduces the identical map+start+goal every time.
 
 No per-step trajectory logging -- only one row per episode (ids + outcome +
-path_length_m/episode_duration_s), per the "just the id should be enough"
-scope of this evaluation. path_length_m is the true integrated path length
+path_length_m/episode_duration_s). path_length_m is the true integrated path length
 (summed step-to-step displacement of the robot's root position, via the same
 env.safety_context() positions used by evaluate_laser_unseen_maps_structured.py's
 own path-length tracking), not a straight-line distance.
@@ -145,6 +144,7 @@ def build_environment(
     action_max_wz: float,
     backup_margin: float | None,
     laser_debug_vis: bool = False,
+    enable_lidar_noise: bool = True,
 ):
     configure_torch_backends()
 
@@ -154,7 +154,10 @@ def build_environment(
         arena=None,
         laser_num_rays=laser_num_rays,
         laser_fov_deg=laser_fov_deg,
-        enable_lidar_noise=True,  # must match training exactly (checkpoint's saved laser dict is compared for full equality)
+        # Default True matches training exactly (checkpoint's saved laser dict
+        # is compared for full equality); callers evaluating a nominal source
+        # other than the trained SAC actor (e.g. a heuristic) pass False.
+        enable_lidar_noise=enable_lidar_noise,
         hard_clip_output=True,
         collision_geometry=collision_geometry,
         collision_circle_radius_m=collision_circle_radius_m,
@@ -200,9 +203,8 @@ def build_environment(
     # Match the training entry point's arena override exactly: only
     # wall/obstacle clearance and obstacles=() are overridden; width/length/
     # wall_thickness/wall_height/robot_radius/max_obstacles/obstacle_shape
-    # come from the bank's own arena (verified identical to LaserSacConfig()
-    # defaults for handcrafted2 -- checked directly against the saved
-    # checkpoint's own navigation.arena dict).
+    # come from the bank's own arena (identical to the LaserSacConfig()
+    # defaults for handcrafted2).
     safety_arena_template = replace(
         bank_arena, obstacles=(), wall_clearance=float(cfg.safety.d_safe), obstacle_clearance=float(cfg.safety.d_safe)
     )
@@ -444,10 +446,9 @@ def main() -> None:
     episodes: list[dict] = []
     for method in args.methods:
         method_env_kwargs = dict(common_env_kwargs)
-        # All three seeds0-4-batch checkpoints (vanilla/cbf_cd_cf/bcbf_cf)
-        # were trained with these terminal-set settings, confirmed via
-        # load_actor's own config-mismatch check (matches the vxm1 3-map
-        # eval scripts, which needed the same override for every method).
+        # The vanilla/cbf_cd_cf/bcbf_cf checkpoints were all trained with
+        # these terminal-set settings; load_actor's config-mismatch check
+        # enforces them for every method.
         method_env_kwargs["terminal_backup_mode"] = "invariant_ellipse"
         method_env_kwargs["legacy_projection"] = True
         evaluate_method(
